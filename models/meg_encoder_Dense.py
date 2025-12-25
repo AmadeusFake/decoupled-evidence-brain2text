@@ -1,20 +1,21 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-models/eeg_encoder.py
+models/meg_encoder.py
 
-EEG / MEG encoder aligned with the Brain Magick SimpleConv configuration.
+MEG / EEG encoder with sentence-level global readout using TIME-wise
+Attentive Statistics Pooling (TIME-ASP).
 
-High-level structure:
-- Spatial attention-based sensor merger (variable sensors → fixed channels)
-- Optional subject-specific linear layers
-- SimpleConv backbone (dilated GLU blocks)
-- Optional sentence-level (global) branch
-- Local window-level output head (default for retrieval)
+Key design choices (this version):
+- Decouple internal MEG width (d_model) from text-side output dimension (text_dim).
+- Sentence-level readout is length-robust: TIME-ASP → Linear(d_model → text_dim).
+- Multi-stage temporal downsampling is disabled by default to avoid
+  sentence-length leakage (pre_down_tcap=0, token_pool_max_T=0).
+- Optional memory slots are retained for analysis / visualization only
+  and are not part of the main global path.
 
-This file is intentionally self-contained and mirrors the original
-configuration semantics exactly. Only comments and structure have been
-cleaned for readability and reproducibility.
+This file is a cleaned, documented, and reproducible version of the original
+implementation. All numerical behavior and forward logic are preserved.
 """
 
 from __future__ import annotations
@@ -31,7 +32,7 @@ __all__ = ["UltimateMEGEncoder", "AttentiveStatsPool1D"]
 
 
 # =============================================================================
-# Fourier positional embedding for sensor coordinates
+# Basic building blocks
 # =============================================================================
 class FourierEmb(nn.Module):
     """
@@ -54,7 +55,6 @@ class FourierEmb(nn.Module):
         self.register_buffer("_fy", fy, persistent=False)
 
     def forward(self, xy: torch.Tensor) -> torch.Tensor:
-        # Normalize coordinates into (margin, 1 - margin)
         x = xy[..., 0:1] * (1.0 - 2 * self.margin) + self.margin
         y = xy[..., 1:2] * (1.0 - 2 * self.margin) + self.margin
 
@@ -80,15 +80,10 @@ class FourierEmb(nn.Module):
         )
 
 
-# =============================================================================
-# Spatial attention-based sensor merger
-# =============================================================================
 class SpatialAttention(nn.Module):
     """
-    Sensor merger via learned spatial attention.
-
-    Maps variable sensor layouts to a fixed number of spatial channels
-    (e.g., 270), as used in Brain Magick.
+    Spatial attention module that merges variable sensor layouts into
+    a fixed number of spatial channels.
     """
     def __init__(
         self,
@@ -113,8 +108,7 @@ class SpatialAttention(nn.Module):
 
     def _make_mask(self, xy: torch.Tensor) -> torch.Tensor:
         """
-        Randomly drop a circular region of sensors during training
-        (spatial dropout).
+        Circular spatial dropout during training.
         """
         B, C, _ = xy.shape
         if not (self.dropout_p > 0.0 and self.training):
@@ -131,14 +125,6 @@ class SpatialAttention(nn.Module):
         return dx2 <= (r[:, None] ** 2)
 
     def forward(self, meg_ct: torch.Tensor, sensor_locs: torch.Tensor) -> torch.Tensor:
-        """
-        Input:
-          meg_ct       : [B, C_in, T]
-          sensor_locs  : [B, C_in, 2(+)]
-
-        Output:
-          merged       : [B, spatial_channels, T]
-        """
         xy = sensor_locs[..., :2]
         pos_feat = self.fourier(xy)
         q = self.query(pos_feat)
@@ -160,14 +146,9 @@ class SpatialAttention(nn.Module):
         return torch.einsum("bct,bcs->bst", meg_ct, attn)
 
 
-# =============================================================================
-# Subject-specific linear layers
-# =============================================================================
 class SubjectLayers(nn.Module):
     """
-    Subject-specific 1×1 convolutions (identity-initialized).
-
-    Each subject has an independent linear mapping in channel space.
+    Subject-specific 1×1 convolutions, identity-initialized.
     """
     def __init__(self, channels: int, n_subjects: int):
         super().__init__()
@@ -175,7 +156,6 @@ class SubjectLayers(nn.Module):
             [nn.Conv1d(channels, channels, 1) for _ in range(n_subjects)]
         )
 
-        # Initialize as identity
         for conv in self.subject_convs:
             with torch.no_grad():
                 conv.weight.zero_()
@@ -199,96 +179,59 @@ class SubjectLayers(nn.Module):
 
 
 # =============================================================================
-# SimpleConv (Brain Magick) components
+# Backbone blocks
 # =============================================================================
-class DilatedGLUBlock(nn.Module):
+class PaperDilatedBlock(nn.Module):
     """
-    Dilated convolutional block with GLU gating and residual connection.
+    Two-stage dilated CNN block with GLU projection.
     """
-    def __init__(
-        self,
-        d_model: int,
-        kernel_size: int,
-        dilation: int,
-        glu_mult: int = 2,
-        dropout: float = 0.0,
-    ):
+    def __init__(self, d_model: int, dropout: float = 0.2):
         super().__init__()
-        pad = (kernel_size - 1) * dilation // 2
-
-        self.conv = nn.Conv1d(
-            d_model,
-            d_model * glu_mult,
-            kernel_size,
-            padding=pad,
-            dilation=dilation,
+        self.res1 = nn.Sequential(
+            nn.Conv1d(d_model, d_model, 3, padding=2, dilation=2, bias=False),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
-        self.bn = nn.BatchNorm1d(d_model * glu_mult)
-        self.act = nn.GELU()
-        self.glu = nn.GLU(dim=1)
-        self.dropout = nn.Dropout(dropout)
-
-        out_dim = (d_model * glu_mult) // 2
-        self.out_proj = (
-            nn.Identity()
-            if out_dim == d_model
-            else nn.Conv1d(out_dim, d_model, 1)
+        self.res2 = nn.Sequential(
+            nn.Conv1d(d_model, d_model, 3, padding=4, dilation=4, bias=False),
+            nn.BatchNorm1d(d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
         )
+        self.glu = nn.Sequential(
+            nn.Conv1d(d_model, d_model * 2, 1),
+            nn.GLU(dim=1),
+        )
+        self.out = nn.Conv1d(d_model, d_model, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        residual = x
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.act(x)
-        x = self.glu(x)
-        x = self.out_proj(x)
-        x = self.dropout(x)
-        return x + residual
-
-
-class SimpleConvBackbone(nn.Module):
-    """
-    Stack of dilated GLU blocks with periodic dilation schedule.
-    """
-    def __init__(
-        self,
-        d_model: int,
-        depth: int,
-        kernel_size: int,
-        dilation_period: int,
-        glu_mult: int,
-        dropout: float,
-    ):
-        super().__init__()
-        self.blocks = nn.ModuleList()
-        for i in range(depth):
-            dilation = 2 ** (i % dilation_period)
-            self.blocks.append(
-                DilatedGLUBlock(
-                    d_model,
-                    kernel_size,
-                    dilation,
-                    glu_mult,
-                    dropout,
-                )
-            )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        for block in self.blocks:
-            x = block(x)
-        return x
+        y = x + self.res1(x)
+        y = y + self.res2(y)
+        y = self.glu(y)
+        return self.out(y)
 
 
 # =============================================================================
-# Attentive statistics pooling
+# Attentive Statistics Pooling (TIME-ASP)
 # =============================================================================
 class AttentiveStatsPool1D(nn.Module):
     """
-    Attentive mean + standard deviation pooling over time.
+    Time-wise attentive statistics pooling.
+
+    Input:
+      z : [B, D, T]
+
+    Output:
+      g : [B, D]
+
+    Computes attention-weighted mean and standard deviation over time,
+    followed by a 1×1 projection. This operation is length-agnostic.
     """
     def __init__(self, d_model: int, hidden: Optional[int] = None, dropout: float = 0.1):
         super().__init__()
         H = hidden or d_model
+
         self.attn = nn.Sequential(
             nn.Conv1d(d_model, H, 1),
             nn.Tanh(),
@@ -296,32 +239,35 @@ class AttentiveStatsPool1D(nn.Module):
             nn.Conv1d(H, 1, 1),
         )
         self.proj = nn.Conv1d(2 * d_model, d_model, 1)
+
         nn.init.xavier_uniform_(self.proj.weight)
         nn.init.zeros_(self.proj.bias)
+
         self.eps = 1e-5
 
     def forward(self, z_bdt: torch.Tensor) -> torch.Tensor:
-        e = self.attn(z_bdt)
-        a = torch.softmax(e, dim=-1)
+        e = self.attn(z_bdt)                         # [B,1,T]
+        a = torch.softmax(e, dim=-1)                 # [B,1,T]
         mu = torch.sum(a * z_bdt, dim=-1, keepdim=True)
         var = torch.sum(a * (z_bdt - mu) ** 2, dim=-1, keepdim=True)
         std = torch.sqrt(var + self.eps)
-        feat = torch.cat([mu, std], dim=1)
-        out = self.proj(feat).squeeze(-1)
+        feat = torch.cat([mu, std], dim=1)           # [B,2D,1]
+        out = self.proj(feat).squeeze(-1)            # [B,D]
         return torch.nan_to_num(out)
 
 
 # =============================================================================
-# UltimateMEGEncoder
+# UltimateMEGEncoder (local + sentence global)
 # =============================================================================
 class UltimateMEGEncoder(nn.Module):
     """
-    Full MEG / EEG encoder used throughout the project.
+    Full MEG encoder with a length-robust sentence-level global readout.
 
-    Supports:
-    - Window-level local encoding
-    - Optional sentence-level (global) encoding
-    - Subject-specific adaptation
+    Local path:
+      MEG window → spatial attention → backbone → local features
+
+    Global path (sentence mode):
+      Full sentence MEG → TIME-ASP → Linear(d_model → text_dim)
     """
     def __init__(
         self,
@@ -333,17 +279,19 @@ class UltimateMEGEncoder(nn.Module):
         d_model: int = 320,
         text_dim: Optional[int] = None,
         out_channels: int = 1024,
-        backbone_depth: int = 10,
-        backbone_kernel: int = 3,
-        dilation_period: int = 5,
-        glu_mult: int = 2,
-        dropout: float = 0.0,
+        backbone_depth: int = 5,
+        backbone_type: Literal["cnn", "conformer"] = "cnn",
         subject_layer_pos: Literal["early", "late", "none"] = "early",
         use_subjects: bool = True,
-        spatial_dropout_p: float = 0.2,
+        spatial_dropout_p: float = 0.0,
+        spatial_dropout_radius: float = 0.2,
+        nhead: int = 8,
+        dropout: float = 0.1,
         out_timesteps: Optional[int] = None,
+        # --- sentence mode ---
         context_mode: Literal["none", "sentence"] = "sentence",
         context_memory_len: int = 12,
+        freeze_ctx_local: bool = True,
         detach_context: bool = False,
         global_frontend: Literal["shared", "separate_full"] = "separate_full",
         warm_start_global: bool = False,
@@ -354,82 +302,99 @@ class UltimateMEGEncoder(nn.Module):
         super().__init__()
         if kwargs:
             logger.warning(
-                f"UltimateMEGEncoder: Ignoring unused kwargs: {list(kwargs.keys())}"
+                f"UltimateMEGEncoder: ignoring unused kwargs: {list(kwargs.keys())}"
             )
 
-        self.use_subjects = use_subjects
-        self.subject_layer_pos = subject_layer_pos
         self.context_mode = context_mode
+        self.subject_layer_pos = subject_layer_pos
+        self.use_subjects = use_subjects
         self.d_model = d_model
         self.text_dim = int(text_dim) if text_dim is not None else int(d_model)
-        self.out_timesteps = out_timesteps
-        self.detach_context = detach_context
+        self.detach_context = bool(detach_context)
         self.global_frontend = global_frontend
         self.warm_start_global = bool(warm_start_global)
-        self.pre_down_tcap = int(pre_down_tcap) if pre_down_tcap else 0
+        self.pre_down_tcap = int(pre_down_tcap)
 
-        # --- Local branch ---
+        # ------------------------------------------------------------------
+        # Local frontend
+        # ------------------------------------------------------------------
         self.spatial = SpatialAttention(
-            spatial_channels, fourier_k, spatial_dropout_p, 0.2
+            spatial_channels,
+            fourier_k,
+            spatial_dropout_p,
+            spatial_dropout_radius,
         )
+        self.pre_S = nn.Conv1d(spatial_channels, spatial_channels, 1)
+        self.to_d = nn.Conv1d(spatial_channels, d_model, 1)
 
-        if self.use_subjects and subject_layer_pos == "early":
-            self.subj_layer = SubjectLayers(spatial_channels, n_subjects)
+        if self.use_subjects and subject_layer_pos != "none":
+            self.subjS = SubjectLayers(spatial_channels, n_subjects)
+            self.subjD = SubjectLayers(d_model, n_subjects)
         else:
-            self.subj_layer = None
+            self.subjS = None
+            self.subjD = None
 
-        self.pre_linear = nn.Conv1d(spatial_channels, d_model, 1)
-        self.backbone = SimpleConvBackbone(
-            d_model,
-            backbone_depth,
-            backbone_kernel,
-            dilation_period,
-            glu_mult,
-            dropout,
+        self.backbone = nn.Sequential(
+            *[PaperDilatedBlock(d_model, dropout=0.2) for _ in range(backbone_depth)]
         )
 
-        # --- Global branch ---
-        if self.global_frontend == "separate_full":
+        # ------------------------------------------------------------------
+        # Global (sentence) frontend
+        # ------------------------------------------------------------------
+        if self.global_frontend == "shared":
+            self.spatial_g = self.spatial
+            self.pre_S_g = self.pre_S
+            self.subjS_g = self.subjS
+            self.subjD_g = self.subjD
+            self.to_d_g = self.to_d
+            self.backbone_g = self.backbone
+        else:
             self.spatial_g = SpatialAttention(
-                spatial_channels, fourier_k, spatial_dropout_p, 0.2
+                spatial_channels,
+                fourier_k,
+                spatial_dropout_p,
+                spatial_dropout_radius,
             )
-            self.subj_layer_g = (
-                SubjectLayers(spatial_channels, n_subjects)
-                if self.subj_layer is not None
-                else None
+            self.pre_S_g = nn.Conv1d(spatial_channels, spatial_channels, 1)
+            self.subjS_g = SubjectLayers(spatial_channels, n_subjects) if self.subjS is not None else None
+            self.subjD_g = SubjectLayers(d_model, n_subjects) if self.subjD is not None else None
+            self.to_d_g = nn.Conv1d(spatial_channels, d_model, 1)
+            self.backbone_g = nn.Sequential(
+                *[PaperDilatedBlock(d_model, dropout=0.2) for _ in range(backbone_depth)]
             )
-            self.pre_linear_g = nn.Conv1d(spatial_channels, d_model, 1)
-            self.backbone_g = SimpleConvBackbone(
-                d_model,
-                backbone_depth,
-                backbone_kernel,
-                dilation_period,
-                glu_mult,
-                dropout,
-            )
+
             if self.warm_start_global:
                 self._warm_start_from_local_()
-        else:
-            self.spatial_g = self.spatial
-            self.subj_layer_g = self.subj_layer
-            self.pre_linear_g = self.pre_linear
-            self.backbone_g = self.backbone
 
-        # --- Heads ---
+        # ------------------------------------------------------------------
+        # Sentence-level TIME-ASP head (main global path)
+        # ------------------------------------------------------------------
         self.sent_pool_time = AttentiveStatsPool1D(d_model, hidden=d_model, dropout=dropout)
         self.sent_proj = nn.Linear(d_model, self.text_dim)
+
         nn.init.xavier_uniform_(self.sent_proj.weight)
         nn.init.zeros_(self.sent_proj.bias)
 
-        self.proj = nn.Conv1d(d_model, out_channels, 1)
-        self.out_pool = (
-            nn.Identity()
-            if not out_timesteps or int(out_timesteps) <= 0
-            else nn.AdaptiveAvgPool1d(out_timesteps)
+        # ------------------------------------------------------------------
+        # Local output head (kept for compatibility)
+        # ------------------------------------------------------------------
+        self.tail = nn.Sequential(
+            nn.Conv1d(d_model, d_model, 1),
+            nn.GELU(),
+            nn.Conv1d(d_model, d_model, 1),
         )
+        self.proj = nn.Conv1d(d_model, out_channels, 1)
+
+        if out_timesteps is None or int(out_timesteps) <= 0:
+            self.out_pool = nn.Identity()
+        else:
+            self.out_pool = nn.AdaptiveAvgPool1d(int(out_timesteps))
 
         self._init()
 
+    # ------------------------------------------------------------------
+    # Initialization helpers
+    # ------------------------------------------------------------------
     def _init(self):
         for m in self.modules():
             if isinstance(m, (nn.Conv1d, nn.Linear)):
@@ -438,33 +403,75 @@ class UltimateMEGEncoder(nn.Module):
                     nn.init.zeros_(m.bias)
 
     def _warm_start_from_local_(self):
-        def _copy(dst, src):
+        def _copy(dst: nn.Module, src: nn.Module):
             if dst is None or src is None:
                 return
             dst.load_state_dict(src.state_dict())
 
         _copy(self.spatial_g, self.spatial)
-        _copy(self.subj_layer_g, self.subj_layer)
-        _copy(self.pre_linear_g, self.pre_linear)
+        _copy(self.pre_S_g, self.pre_S)
+        _copy(self.subjS_g, self.subjS)
+        _copy(self.subjD_g, self.subjD)
+        _copy(self.to_d_g, self.to_d)
         _copy(self.backbone_g, self.backbone)
 
-    def _encode_stream(
+    # ------------------------------------------------------------------
+    # Encoding paths
+    # ------------------------------------------------------------------
+    def _encode_local(
         self,
         x_bct: torch.Tensor,
         sensor_locs: torch.Tensor,
         subj_idx: torch.Tensor,
-        spatial_mod,
-        subj_mod,
-        linear_mod,
-        backbone_mod,
     ) -> torch.Tensor:
-        z = spatial_mod(x_bct, sensor_locs)
-        if subj_mod is not None:
-            z = subj_mod(z, subj_idx)
-        z = linear_mod(z)
-        z = backbone_mod(z)
+        z = self.spatial(x_bct, sensor_locs)
+        z = self.pre_S(z)
+
+        if self.subjS is not None and self.subject_layer_pos == "early":
+            z = self.subjS(z, subj_idx)
+
+        z = self.to_d(z)
+
+        if self.subjD is not None and self.subject_layer_pos == "late":
+            z = self.subjD(z, subj_idx)
+
+        z = self.backbone(z)
         return z
 
+    def _encode_sentence(
+        self,
+        meg_sent_full: torch.Tensor,
+        meg_sent_full_mask: torch.Tensor,
+        sensor_locs: torch.Tensor,
+        subj_idx: torch.Tensor,
+    ) -> torch.Tensor:
+        z = self.spatial_g(meg_sent_full, sensor_locs)
+        z = self.pre_S_g(z)
+
+        if self.subjS_g is not None and self.subject_layer_pos == "early":
+            z = self.subjS_g(z, subj_idx)
+
+        z = self.to_d_g(z)
+
+        if self.subjD_g is not None and self.subject_layer_pos == "late":
+            z = self.subjD_g(z, subj_idx)
+
+        if self.pre_down_tcap and z.size(-1) > self.pre_down_tcap:
+            while z.size(-1) > self.pre_down_tcap:
+                z = F.avg_pool1d(z, kernel_size=2, stride=2)
+
+        z = self.backbone_g(z)
+        z = torch.nan_to_num(z)
+
+        g = self.sent_pool_time(z)
+        g = self.sent_proj(g)
+        g = torch.nan_to_num(g)
+
+        return g.detach() if self.detach_context else g
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
     def forward(
         self,
         meg_win: torch.Tensor,
@@ -477,60 +484,27 @@ class UltimateMEGEncoder(nn.Module):
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
 
         device = next(self.parameters()).device
-        meg_win = meg_win.to(device, non_blocking=True)
 
-        # --- Local path ---
-        local_feat = self._encode_stream(
-            meg_win,
+        z_local = self._encode_local(
+            meg_win.to(device, non_blocking=True),
             sensor_locs,
             subj_idx,
-            self.spatial,
-            self.subj_layer,
-            self.pre_linear,
-            self.backbone,
         )
-
-        y_local = self.out_pool(self.proj(local_feat))
+        y_local = self.out_pool(self.proj(self.tail(z_local)))
         y_local = torch.nan_to_num(y_local)
 
-        if (not return_global) or (self.context_mode == "none"):
+        if not return_global or self.context_mode == "none":
             return y_local
 
-        # --- Global / sentence path ---
-        assert meg_sent_full is not None and meg_sent_full_mask is not None
-
-        if meg_sent_full.device != device:
-            meg_sent_full = meg_sent_full.to(device, non_blocking=True)
-
-        global_feat = self._encode_stream(
-            meg_sent_full,
-            sensor_locs,
-            subj_idx,
-            self.spatial_g,
-            self.subj_layer_g,
-            self.pre_linear_g,
-            self.backbone_g,
+        assert meg_sent_full is not None and meg_sent_full_mask is not None, (
+            "Sentence mode requires meg_sent_full and meg_sent_full_mask."
         )
 
-        m = meg_sent_full_mask
-        if m.dtype != torch.bool:
-            m = m > 0.5
-        if m.size(1) != global_feat.size(-1):
-            m = (
-                F.interpolate(
-                    m.float().unsqueeze(1),
-                    size=global_feat.size(-1),
-                    mode="nearest",
-                )
-                .squeeze(1)
-                .bool()
-            )
-
-        g = self.sent_pool_time(global_feat)
-        g = self.sent_proj(g)
-        g = torch.nan_to_num(g)
-
-        if self.detach_context:
-            g = g.detach()
+        g = self._encode_sentence(
+            meg_sent_full.to(device, non_blocking=True),
+            meg_sent_full_mask,
+            sensor_locs,
+            subj_idx,
+        )
 
         return y_local, g

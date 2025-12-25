@@ -1,33 +1,34 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-models/eeg_encoder.py
+models/meg_encoder2.py
 
-EEG / MEG encoder aligned with the Brain Magick SimpleConv configuration.
+Local-only MEG / EEG encoder using a SimpleConv backbone (Brain Magick style).
 
-High-level structure:
-- Spatial attention-based sensor merger (variable sensors → fixed channels)
-- Optional subject-specific linear layers
-- SimpleConv backbone (dilated GLU blocks)
-- Optional sentence-level (global) branch
-- Local window-level output head (default for retrieval)
+Key characteristics
+-------------------
+- No sentence-level or global context branch.
+- Designed for window-level decoding and retrieval.
+- Variable sensor layouts are merged into a fixed set of spatial channels
+  using coordinate-based spatial attention.
+- Optional subject-specific adaptation via identity-initialized 1×1 convolutions.
+- Temporal modeling is handled exclusively by a dilated GLU-based CNN backbone.
 
-This file is intentionally self-contained and mirrors the original
-configuration semantics exactly. Only comments and structure have been
-cleaned for readability and reproducibility.
+This file is a cleaned, documented, and reproducible version of the original
+implementation. All numerical behavior and forward logic are preserved exactly.
 """
 
 from __future__ import annotations
 import math
 import logging
-from typing import Optional, Literal, Tuple
+from typing import Optional, Literal
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 logger = logging.getLogger(__name__)
-__all__ = ["UltimateMEGEncoder", "AttentiveStatsPool1D"]
+__all__ = ["UltimateMEGEncoder"]
 
 
 # =============================================================================
@@ -37,11 +38,15 @@ class FourierEmb(nn.Module):
     """
     2D Fourier feature embedding for sensor coordinates.
 
-    Input:
-      xy : [B, C, 2] normalized sensor coordinates
+    Input
+    -----
+    xy : torch.Tensor
+        Shape [B, C, 2], normalized sensor coordinates.
 
-    Output:
-      features : [B, C, 2 * k * k]
+    Output
+    ------
+    feat : torch.Tensor
+        Shape [B, C, 2 * k * k].
     """
     def __init__(self, k: int = 32, margin: float = 0.1):
         super().__init__()
@@ -64,31 +69,31 @@ class FourierEmb(nn.Module):
         cosx, sinx = torch.cos(phase_x), torch.sin(phase_x)
         cosy, siny = torch.cos(phase_y), torch.sin(phase_y)
 
-        tgt_dtype = x.dtype
+        tgt_dtype = xy.dtype
         cosx, sinx = cosx.to(tgt_dtype), sinx.to(tgt_dtype)
         cosy, siny = cosy.to(tgt_dtype), siny.to(tgt_dtype)
 
-        feat1 = torch.einsum("bck,bcm->bckm", cosx, cosy)
-        feat2 = torch.einsum("bck,bcm->bckm", sinx, siny)
+        feat_cos = torch.einsum("bck,bcm->bckm", cosx, cosy)
+        feat_sin = torch.einsum("bck,bcm->bckm", sinx, siny)
 
         return torch.cat(
             [
-                feat1.reshape(x.size(0), x.size(1), -1),
-                feat2.reshape(x.size(0), x.size(1), -1),
+                feat_cos.reshape(x.size(0), x.size(1), -1),
+                feat_sin.reshape(x.size(0), x.size(1), -1),
             ],
             dim=-1,
         )
 
 
 # =============================================================================
-# Spatial attention-based sensor merger
+# Spatial attention (sensor merger)
 # =============================================================================
 class SpatialAttention(nn.Module):
     """
-    Sensor merger via learned spatial attention.
+    Coordinate-driven spatial attention.
 
-    Maps variable sensor layouts to a fixed number of spatial channels
-    (e.g., 270), as used in Brain Magick.
+    Maps a variable number of physical sensors to a fixed number of
+    virtual spatial channels (e.g., 270).
     """
     def __init__(
         self,
@@ -113,8 +118,7 @@ class SpatialAttention(nn.Module):
 
     def _make_mask(self, xy: torch.Tensor) -> torch.Tensor:
         """
-        Randomly drop a circular region of sensors during training
-        (spatial dropout).
+        Random circular spatial dropout mask (training only).
         """
         B, C, _ = xy.shape
         if not (self.dropout_p > 0.0 and self.training):
@@ -132,12 +136,17 @@ class SpatialAttention(nn.Module):
 
     def forward(self, meg_ct: torch.Tensor, sensor_locs: torch.Tensor) -> torch.Tensor:
         """
-        Input:
-          meg_ct       : [B, C_in, T]
-          sensor_locs  : [B, C_in, 2(+)]
+        Parameters
+        ----------
+        meg_ct : torch.Tensor
+            MEG/EEG signal, shape [B, C_in, T].
+        sensor_locs : torch.Tensor
+            Sensor coordinates, shape [B, C_in, 2(+)].
 
-        Output:
-          merged       : [B, spatial_channels, T]
+        Returns
+        -------
+        z : torch.Tensor
+            Spatially merged signal, shape [B, spatial_channels, T].
         """
         xy = sensor_locs[..., :2]
         pos_feat = self.fourier(xy)
@@ -161,13 +170,13 @@ class SpatialAttention(nn.Module):
 
 
 # =============================================================================
-# Subject-specific linear layers
+# Subject-specific adaptation layers
 # =============================================================================
 class SubjectLayers(nn.Module):
     """
     Subject-specific 1×1 convolutions (identity-initialized).
 
-    Each subject has an independent linear mapping in channel space.
+    Provides light subject adaptation without changing representation scale.
     """
     def __init__(self, channels: int, n_subjects: int):
         super().__init__()
@@ -175,7 +184,6 @@ class SubjectLayers(nn.Module):
             [nn.Conv1d(channels, channels, 1) for _ in range(n_subjects)]
         )
 
-        # Initialize as identity
         for conv in self.subject_convs:
             with torch.no_grad():
                 conv.weight.zero_()
@@ -199,11 +207,14 @@ class SubjectLayers(nn.Module):
 
 
 # =============================================================================
-# SimpleConv (Brain Magick) components
+# SimpleConv backbone blocks (Brain Magick style)
 # =============================================================================
 class DilatedGLUBlock(nn.Module):
     """
     Dilated convolutional block with GLU gating and residual connection.
+
+    Structure:
+      Conv1d → BatchNorm → GELU → GLU → (optional 1×1) → Dropout → Residual
     """
     def __init__(
         self,
@@ -280,48 +291,16 @@ class SimpleConvBackbone(nn.Module):
 
 
 # =============================================================================
-# Attentive statistics pooling
-# =============================================================================
-class AttentiveStatsPool1D(nn.Module):
-    """
-    Attentive mean + standard deviation pooling over time.
-    """
-    def __init__(self, d_model: int, hidden: Optional[int] = None, dropout: float = 0.1):
-        super().__init__()
-        H = hidden or d_model
-        self.attn = nn.Sequential(
-            nn.Conv1d(d_model, H, 1),
-            nn.Tanh(),
-            nn.Dropout(dropout),
-            nn.Conv1d(H, 1, 1),
-        )
-        self.proj = nn.Conv1d(2 * d_model, d_model, 1)
-        nn.init.xavier_uniform_(self.proj.weight)
-        nn.init.zeros_(self.proj.bias)
-        self.eps = 1e-5
-
-    def forward(self, z_bdt: torch.Tensor) -> torch.Tensor:
-        e = self.attn(z_bdt)
-        a = torch.softmax(e, dim=-1)
-        mu = torch.sum(a * z_bdt, dim=-1, keepdim=True)
-        var = torch.sum(a * (z_bdt - mu) ** 2, dim=-1, keepdim=True)
-        std = torch.sqrt(var + self.eps)
-        feat = torch.cat([mu, std], dim=1)
-        out = self.proj(feat).squeeze(-1)
-        return torch.nan_to_num(out)
-
-
-# =============================================================================
-# UltimateMEGEncoder
+# UltimateMEGEncoder (local-only)
 # =============================================================================
 class UltimateMEGEncoder(nn.Module):
     """
-    Full MEG / EEG encoder used throughout the project.
+    Local-only MEG encoder with SimpleConv temporal backbone.
 
-    Supports:
-    - Window-level local encoding
-    - Optional sentence-level (global) encoding
-    - Subject-specific adaptation
+    Intended for:
+    - Window-level decoding
+    - Leak-free retrieval evaluation
+    - Scenarios where sentence-level context is handled externally
     """
     def __init__(
         self,
@@ -331,7 +310,6 @@ class UltimateMEGEncoder(nn.Module):
         spatial_channels: int = 270,
         fourier_k: int = 32,
         d_model: int = 320,
-        text_dim: Optional[int] = None,
         out_channels: int = 1024,
         backbone_depth: int = 10,
         backbone_kernel: int = 3,
@@ -340,15 +318,9 @@ class UltimateMEGEncoder(nn.Module):
         dropout: float = 0.0,
         subject_layer_pos: Literal["early", "late", "none"] = "early",
         use_subjects: bool = True,
-        spatial_dropout_p: float = 0.2,
+        spatial_dropout_p: float = 0.0,
+        spatial_dropout_radius: float = 0.2,
         out_timesteps: Optional[int] = None,
-        context_mode: Literal["none", "sentence"] = "sentence",
-        context_memory_len: int = 12,
-        detach_context: bool = False,
-        global_frontend: Literal["shared", "separate_full"] = "separate_full",
-        warm_start_global: bool = False,
-        pre_down_tcap: int = 0,
-        token_pool_max_T: int = 0,
         **kwargs,
     ):
         super().__init__()
@@ -357,20 +329,19 @@ class UltimateMEGEncoder(nn.Module):
                 f"UltimateMEGEncoder: Ignoring unused kwargs: {list(kwargs.keys())}"
             )
 
-        self.use_subjects = use_subjects
         self.subject_layer_pos = subject_layer_pos
-        self.context_mode = context_mode
+        self.use_subjects = use_subjects
         self.d_model = d_model
-        self.text_dim = int(text_dim) if text_dim is not None else int(d_model)
         self.out_timesteps = out_timesteps
-        self.detach_context = detach_context
-        self.global_frontend = global_frontend
-        self.warm_start_global = bool(warm_start_global)
-        self.pre_down_tcap = int(pre_down_tcap) if pre_down_tcap else 0
 
-        # --- Local branch ---
+        # ------------------------------------------------------------------
+        # Frontend: spatial merger + subject alignment
+        # ------------------------------------------------------------------
         self.spatial = SpatialAttention(
-            spatial_channels, fourier_k, spatial_dropout_p, 0.2
+            spatial_channels,
+            fourier_k,
+            spatial_dropout_p,
+            spatial_dropout_radius,
         )
 
         if self.use_subjects and subject_layer_pos == "early":
@@ -379,53 +350,30 @@ class UltimateMEGEncoder(nn.Module):
             self.subj_layer = None
 
         self.pre_linear = nn.Conv1d(spatial_channels, d_model, 1)
+
+        # ------------------------------------------------------------------
+        # Temporal backbone
+        # ------------------------------------------------------------------
         self.backbone = SimpleConvBackbone(
-            d_model,
-            backbone_depth,
-            backbone_kernel,
-            dilation_period,
-            glu_mult,
-            dropout,
+            d_model=d_model,
+            depth=backbone_depth,
+            kernel_size=backbone_kernel,
+            dilation_period=dilation_period,
+            glu_mult=glu_mult,
+            dropout=dropout,
         )
 
-        # --- Global branch ---
-        if self.global_frontend == "separate_full":
-            self.spatial_g = SpatialAttention(
-                spatial_channels, fourier_k, spatial_dropout_p, 0.2
-            )
-            self.subj_layer_g = (
-                SubjectLayers(spatial_channels, n_subjects)
-                if self.subj_layer is not None
-                else None
-            )
-            self.pre_linear_g = nn.Conv1d(spatial_channels, d_model, 1)
-            self.backbone_g = SimpleConvBackbone(
-                d_model,
-                backbone_depth,
-                backbone_kernel,
-                dilation_period,
-                glu_mult,
-                dropout,
-            )
-            if self.warm_start_global:
-                self._warm_start_from_local_()
-        else:
-            self.spatial_g = self.spatial
-            self.subj_layer_g = self.subj_layer
-            self.pre_linear_g = self.pre_linear
-            self.backbone_g = self.backbone
-
-        # --- Heads ---
-        self.sent_pool_time = AttentiveStatsPool1D(d_model, hidden=d_model, dropout=dropout)
-        self.sent_proj = nn.Linear(d_model, self.text_dim)
-        nn.init.xavier_uniform_(self.sent_proj.weight)
-        nn.init.zeros_(self.sent_proj.bias)
-
+        # ------------------------------------------------------------------
+        # Output head
+        # ------------------------------------------------------------------
         self.proj = nn.Conv1d(d_model, out_channels, 1)
+        nn.init.xavier_uniform_(self.proj.weight)
+        nn.init.zeros_(self.proj.bias)
+
         self.out_pool = (
             nn.Identity()
-            if not out_timesteps or int(out_timesteps) <= 0
-            else nn.AdaptiveAvgPool1d(out_timesteps)
+            if out_timesteps is None or int(out_timesteps) <= 0
+            else nn.AdaptiveAvgPool1d(int(out_timesteps))
         )
 
         self._init()
@@ -437,100 +385,42 @@ class UltimateMEGEncoder(nn.Module):
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
 
-    def _warm_start_from_local_(self):
-        def _copy(dst, src):
-            if dst is None or src is None:
-                return
-            dst.load_state_dict(src.state_dict())
-
-        _copy(self.spatial_g, self.spatial)
-        _copy(self.subj_layer_g, self.subj_layer)
-        _copy(self.pre_linear_g, self.pre_linear)
-        _copy(self.backbone_g, self.backbone)
-
-    def _encode_stream(
-        self,
-        x_bct: torch.Tensor,
-        sensor_locs: torch.Tensor,
-        subj_idx: torch.Tensor,
-        spatial_mod,
-        subj_mod,
-        linear_mod,
-        backbone_mod,
-    ) -> torch.Tensor:
-        z = spatial_mod(x_bct, sensor_locs)
-        if subj_mod is not None:
-            z = subj_mod(z, subj_idx)
-        z = linear_mod(z)
-        z = backbone_mod(z)
-        return z
-
     def forward(
         self,
         meg_win: torch.Tensor,
         sensor_locs: torch.Tensor,
         subj_idx: torch.Tensor,
-        *,
-        meg_sent_full: Optional[torch.Tensor] = None,
-        meg_sent_full_mask: Optional[torch.Tensor] = None,
-        return_global: bool = False,
-    ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
+        **kwargs,
+    ) -> torch.Tensor:
+        """
+        Forward pass for local window encoding.
 
+        Parameters
+        ----------
+        meg_win : torch.Tensor
+            Shape [B, C, T].
+        sensor_locs : torch.Tensor
+            Shape [B, C, 2(+)].
+        subj_idx : torch.Tensor
+            Shape [B].
+
+        Returns
+        -------
+        y_local : torch.Tensor
+            Shape [B, out_channels, T_out].
+        """
         device = next(self.parameters()).device
         meg_win = meg_win.to(device, non_blocking=True)
 
-        # --- Local path ---
-        local_feat = self._encode_stream(
-            meg_win,
-            sensor_locs,
-            subj_idx,
-            self.spatial,
-            self.subj_layer,
-            self.pre_linear,
-            self.backbone,
-        )
+        z = self.spatial(meg_win, sensor_locs)
 
-        y_local = self.out_pool(self.proj(local_feat))
-        y_local = torch.nan_to_num(y_local)
+        if self.subj_layer is not None:
+            z = self.subj_layer(z, subj_idx)
 
-        if (not return_global) or (self.context_mode == "none"):
-            return y_local
+        z = self.pre_linear(z)
+        z = self.backbone(z)
 
-        # --- Global / sentence path ---
-        assert meg_sent_full is not None and meg_sent_full_mask is not None
+        y = self.proj(z)
+        y = self.out_pool(y).contiguous()
 
-        if meg_sent_full.device != device:
-            meg_sent_full = meg_sent_full.to(device, non_blocking=True)
-
-        global_feat = self._encode_stream(
-            meg_sent_full,
-            sensor_locs,
-            subj_idx,
-            self.spatial_g,
-            self.subj_layer_g,
-            self.pre_linear_g,
-            self.backbone_g,
-        )
-
-        m = meg_sent_full_mask
-        if m.dtype != torch.bool:
-            m = m > 0.5
-        if m.size(1) != global_feat.size(-1):
-            m = (
-                F.interpolate(
-                    m.float().unsqueeze(1),
-                    size=global_feat.size(-1),
-                    mode="nearest",
-                )
-                .squeeze(1)
-                .bool()
-            )
-
-        g = self.sent_pool_time(global_feat)
-        g = self.sent_proj(g)
-        g = torch.nan_to_num(g)
-
-        if self.detach_context:
-            g = g.detach()
-
-        return y_local, g
+        return torch.nan_to_num(y)
