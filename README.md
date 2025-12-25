@@ -1,51 +1,102 @@
 # Decoupled Evidence Aggregation Stabilizes Non-invasive Neural Semantic Decoding
 
-This repository contains code and manuscript for:
+Code + manuscript for:
 
-**“Decoupled Evidence Aggregation Stabilizes Non-invasive Neural Semantic Decoding” (Zhang et al., 2025).**
+**“Decoupled Evidence Aggregation for Non-invasive Brain-to-Text Retrieval” (Zhang et al., 2025)**
 
-We revisit non-invasive speech decoding from MEG/EEG and ask:
+## TL;DR
 
-> How much of the apparent performance in current brain-to-text systems actually comes from the neural signals, and how much from language-model priors and evaluation artefacts?
-
-We show that standard generative MEG→text pipelines can reach strong language metrics even when neural inputs are shuffled or replaced by noise, and propose a **decoupled evidence aggregation** principle that yields more reliable and efficient decoding.
+Non-invasive MEG/EEG brain-to-text systems can look strong on language metrics even when neural evidence is weak or absent, due to priors and evaluation artefacts. We therefore use a **leak-free MEG/EEG → audio retrieval** benchmark as the **primary endpoint**, and introduce **Group Context Boost (GCB)**: a **training-free, test-time** **logit-space** aggregation rule that injects sentence context as an explicit prior without entangling it into encoder training.
 
 ---
 
-## Key ideas
+## What’s in this repo
 
-- **Metric and leakage illusions**  
-  We re-implement recent MEG-to-text systems and show that:
-  - language-based scores (e.g. BERTScore, WER) can be satisfied by prior-driven text that barely uses MEG;
-  - padding, attention masks and noisy transcripts can strongly inflate reported performance.
+- **Manuscript draft** (paper figures/tables and methodological details).
+- **Dataset-specific preprocessing** for building *content-unique* splits and sentence/window manifests.
+- **Neural encoders + audio encoder interface** for retrieval training.
+- **Evaluation scripts** for full-pool retrieval, oracle diagnostics, and **GCB / WindowVote** aggregation variants.
 
-- **Leak-free MEG→audio retrieval**  
-  We move to a strictly leak-free **MEG→audio retrieval** paradigm:
-  - fixed-length 3 s MEG windows retrieve their matching audio segments from large candidate pools;
-  - chance level is explicit, and content-unique pools avoid label overlap and leakage across splits.
-
-- **Narrow, deep encoder under low SNR**  
-  We design a **narrow, deep CNN encoder** with strong local nonlinearities that:
-  - outperforms the published MEG→audio baseline of Défossez et al. (Nat. Mach. Intell., 2023) under the same protocol;
-  - reveals that naively enlarging the temporal receptive field can hurt decoding in low-SNR MEG.
-
-- **Decoupled evidence aggregation (GCB)**  
-  Instead of entangling global context inside the encoder, we:
-  - keep feature extractors largely fixed;
-  - let context act in **logit space** as an explicit prior over candidate sentences.
-
-  We instantiate this as **Group Context Boost (GCB)**:
-  - a **training-free**, group-wise logit re-ranking layer;
-  - combines window-level retrieval scores with sentence-level consensus;
-  - raises zero-shot R@1 from **0.41 to 0.52** (about **27%** relative improvement over the original MEG→audio baseline) with negligible extra FLOPs.
+> Note: The generative MEG→text pipeline exists **only as a diagnostic tool** to expose failure modes (metric illusion, alignment noise, padding/length leakage). **Primary results are retrieval-based.**
 
 ---
 
-## Repository structure (work in progress)
+## Repository layout
 
-The repository is under active development. A typical layout is:
+```
+data_script_gw/      # Gwilliams MEG: manifest building, content-based splits, window extraction
+data_script_MOUS/    # MOUS MEG: BIDS event parsing, Whisper word timestamps, manifest/splits
+data_script_BN/      # Brennan EEG: manifest building, content-based splits, window extraction
 
-- `models/` – MEG/EEG encoders, audio encoders, GCB implementation.  
-- `eval/` – retrieval, voting and bootstrap evaluation scripts.  
-- `configs/` – experiment and model configuration files.  
+models/              # Neural encoders, audio embedding interface, GCB / aggregation modules
+train/               # Training entrypoints (contrastive retrieval training, checkpoints, logging)
+eval/                # Leak-free retrieval evaluation + aggregation (GCB, WindowVote), bootstrap, reports
+tools/               # Utilities: visualization, grid search, assistant evaluation scripts
+script/.             # Utilities: running entrance: bash/sbatch scripts
+.gitignore
+README.md
+```
 
+---
+
+## Core method (paper-aligned)
+
+### 1) Leak-free MEG/EEG → audio retrieval (primary evaluation)
+- Each **fixed-length** neural window queries a **closed candidate pool** of audio segments.
+- Splits are **content-unique** (no shared sentence/audio content across train/val/test).
+- Chance level is explicit; retrieval metrics are rank-based (R@k, MRR, MedR).
+
+### 2) Decoupled evidence aggregation: Group Context Boost (GCB)
+- Keep the encoder and training objective unchanged.
+- At **test time**, aggregate window-level logits within each sentence group into a sentence-level bias, then add it back to each window’s logits.
+- This injects sentence context as a **controlled, auditable prior in logit space**.
+
+---
+
+## Quickstart (typical workflow)
+
+### Step 0 — Prepare an environment
+This repo assumes a standard PyTorch + scientific Python stack, plus speech models used for audio embeddings (e.g., wav2vec2). Exact versions may vary by machine/cluster; treat this as a research codebase under active iteration.
+
+### Step 1 — Build dataset manifests & splits (per dataset)
+Each `data_script_*` folder produces a sentence-level **meta manifest** and **content-based** train/val/test splits. See scripts inside each folder (the entrypoints are dataset-specific).
+
+Examples you’ll typically find/do:
+- Build a JSONL meta manifest (sentence ID, audio interval, neural interval).
+- Construct content keys and split them (e.g., 70/10/20).
+- Extract fixed-length word-anchored windows (e.g., 3s windows at 120 Hz).
+
+### Step 2 — Train retrieval models
+Training scripts live in `train/`. The objective aligns neural embeddings to frozen audio embeddings under a CLIP-style contrastive loss.
+
+### Step 3 — Evaluate (global pool + oracle diagnostics + GCB)
+Evaluation scripts live in `eval/`:
+- Global-pool leak-free retrieval (primary)
+- Oracle-sentence restricted pool (upper-bound diagnostic)
+- Aggregation variants:
+  - `gcb_only` (recommended)
+  - `vote_only` (negative control)
+  - `gcb_vote` (usually weaker than `gcb_only`)
+
+---
+
+## Reproducing the paper’s main comparisons (high level)
+
+The manuscript reports (i) diagnostic generative failure modes and (ii) retrieval-based results across datasets and protocols, plus aggregation ablations.
+
+A typical reproduction checklist:
+1. Build **content-unique** splits for each dataset.
+2. Train Dense CNN and Exp-dilated CNN retrieval encoders under the same protocol.
+3. Run leak-free evaluation on:
+   - Gwilliams (global pool; and session-isolated resplitting if available)
+   - MOUS (global pool)
+   - Brennan EEG (global pool; expected near-chance lower bound)
+4. Run GCB on top of the trained checkpoints (no retraining).
+
+---
+
+## Practical notes
+
+- **Generative pipeline ≠ main benchmark.** Treat it as a stress test for evaluation artefacts (alignment noise, padding/mask leakage, metric insensitivity).
+- **Fixed-length windows** are critical to eliminate length-based shortcuts in sentence-level decoding protocols.
+---
