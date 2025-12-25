@@ -1,57 +1,95 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -euo pipefail
 
+###############################################################################
+# User-editable paths
+# ---------------------------------------------------------------------------
+# Only modify variables in this section when reproducing the pipeline.
+###############################################################################
+
+# Project root directory
 PROJECT_ROOT="/mimer/NOBACKUP/groups/naiss2024-5-164/Xinyu/July_Project"
-DATA_ROOT="$PROJECT_ROOT/data_manifests_local_global"
-SCRIPT_PATH="$PROJECT_ROOT/data_script_gw/stage3_5_add_sentence_full.py"   # ← 上一步我给你的 3.5 脚本路径
 
-# 避免 /tmp 爆满 & MNE 缓存
-export TMPDIR="$PROJECT_ROOT/tmp"
-export TEMP="$TMPDIR"
-export TMP="$TMPDIR"
-export MNE_CACHE_DIR="$PROJECT_ROOT/mne_cache"
-mkdir -p "$TMPDIR" "$MNE_CACHE_DIR"
+# Root directory containing Stage-3 outputs
+DATA_ROOT="${PROJECT_ROOT}/data_manifests_local_global"
 
-# 限制 CPU 线程
+# Stage-3.5 script: add sentence-level full MEG signals
+SCRIPT_PATH="${PROJECT_ROOT}/data_script_gw/stage3_5_add_sentence_full.py"
+
+###############################################################################
+# Temporary directories and caches
+###############################################################################
+
+# Avoid /tmp overflow on HPC systems
+export TMPDIR="${PROJECT_ROOT}/tmp"
+export TEMP="${TMPDIR}"
+export TMP="${TMPDIR}"
+
+# MNE cache for loading and resampling
+export MNE_CACHE_DIR="${PROJECT_ROOT}/mne_cache"
+
+mkdir -p "${TMPDIR}" "${MNE_CACHE_DIR}"
+
+###############################################################################
+# CPU threading limits
+###############################################################################
+
 export OMP_NUM_THREADS=4
 export MKL_NUM_THREADS=4
 export OPENBLAS_NUM_THREADS=4
 export NUMEXPR_NUM_THREADS=4
 
-process () {
-  local data_type="$1"
+###############################################################################
+# Helper: add sentence-full MEG signals for one data family
+###############################################################################
 
-  # 输入：stage3 产物（含 meg_win_path / sensor_coordinates_path 等）
-  local in_dir="$DATA_ROOT/final_splits_${data_type}_fully_preprocessed"
+process_one () {
+  local DATA_TYPE="$1"
 
-  # 输出：整句 MEG 存放目录（按 recording 分子目录），以及“带有 meg_sentence_full_path 的新 manifest”
-  local out_sentence="$DATA_ROOT/precomputed_meg_sentence_full/${data_type}"
-  local out_manifest="$DATA_ROOT/final_splits_${data_type}_with_sentence_full"
+  # Input: Stage-3 fully preprocessed manifests
+  local INPUT_MANIFEST_DIR="${DATA_ROOT}/final_splits_${DATA_TYPE}_fully_preprocessed"
 
-  mkdir -p "$out_sentence" "$out_manifest"
+  # Output: sentence-level full MEG signals
+  local OUTPUT_SENTENCE_DIR="${DATA_ROOT}/precomputed_meg_sentence_full/${DATA_TYPE}"
 
-  echo "== MEG Stage3.5 (add sentence-full): ${data_type} =="
-  python "$SCRIPT_PATH" \
-    --input_manifest_dir "$in_dir" \
-    --output_sentence_dir "$out_sentence" \
-    --output_manifest_dir "$out_manifest" \
+  # Output: updated manifests with `meg_sentence_full_path`
+  local OUTPUT_MANIFEST_DIR="${DATA_ROOT}/final_splits_${DATA_TYPE}_with_sentence_full"
+
+  mkdir -p "${OUTPUT_SENTENCE_DIR}" "${OUTPUT_MANIFEST_DIR}"
+
+  echo "== MEG Stage 3.5: add sentence-full signals | ${DATA_TYPE} =="
+
+  python "${SCRIPT_PATH}" \
+    --input_manifest_dir "${INPUT_MANIFEST_DIR}" \
+    --output_sentence_dir "${OUTPUT_SENTENCE_DIR}" \
+    --output_manifest_dir "${OUTPUT_MANIFEST_DIR}" \
     --target_sfreq 120 \
     --baseline_end_s 0.3 \
     --std_clamp 20 \
     --fit_max_windows_per_recording 200 \
     --resume \
     --verify_existing
-    # 如需全量重算整句，加： --recompute_existing
+    # For a full rebuild, add: --recompute_existing
 }
 
-# 一般我们只需要 sentence；如果也想给 word_list 做整句（可选）就一起跑
-process "sentence"
-process "word_list"
+###############################################################################
+# Run Stage-3.5
+###############################################################################
 
-echo "All sentence-full MEG done."
-echo "New manifests (with 'meg_sentence_full_path'):"
-echo "- $DATA_ROOT/final_splits_sentence_with_sentence_full/"
-echo "- $DATA_ROOT/final_splits_word_list_with_sentence_full/"
+# Sentence-level is required; word_list is optional but supported
+process_one "sentence"
+process_one "word_list"
+
+###############################################################################
+# Final report
+###############################################################################
 
 echo
-echo "训练/评测时，把 --train/--val/--test manifest 指到以上 *_with_sentence_full 目录即可。"
+echo "Sentence-full MEG preprocessing completed successfully ✅"
+echo "New manifests (with 'meg_sentence_full_path'):"
+echo "- ${DATA_ROOT}/final_splits_sentence_with_sentence_full/"
+echo "- ${DATA_ROOT}/final_splits_word_list_with_sentence_full/"
+
+echo
+echo "For training/evaluation, point --train/--val/--test manifests to the"
+echo "*_with_sentence_full directories above."
