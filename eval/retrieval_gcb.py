@@ -48,6 +48,29 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 
+def get_meg_encoder_class(name: str):
+    """
+    Factory for selecting MEG encoder backbone.
+
+    Parameters
+    ----------
+    name : {"dense", "exp"}
+        Encoder variant.
+
+    Returns
+    -------
+    Encoder class (not instance).
+    """
+    name = name.lower()
+    if name == "dense":
+        from models.meg_encoder_Dense import UltimateMEGEncoder
+        return UltimateMEGEncoder
+    elif name == "exp":
+        from models.meg_encoder_ExpDilated import UltimateMEGEncoder
+        return UltimateMEGEncoder
+    else:
+        raise ValueError(f"Unknown meg_encoder: {name}")
+
 # =============================================================================
 # Constants (must match training / frontend assumptions)
 # =============================================================================
@@ -268,7 +291,6 @@ def choose_ckpt_path(args) -> Path:
     return ckpt_path
 
 
-from models.meg_encoder import UltimateMEGEncoder
 
 
 def _read_logit_scale_exp(ckpt_path: Path) -> Optional[float]:
@@ -289,7 +311,7 @@ def _read_logit_scale_exp(ckpt_path: Path) -> Optional[float]:
     return None
 
 
-def load_model_from_ckpt(ckpt_path: Path, run_dir: Path, device: str):
+def load_model_from_ckpt(ckpt_path: Path, run_dir: Path, device: str, meg_encoder: str):
     """Load UltimateMEGEncoder from checkpoint and records config."""
     model_cfg = load_cfg_from_records(run_dir)
     ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -300,11 +322,13 @@ def load_model_from_ckpt(ckpt_path: Path, run_dir: Path, device: str):
 
     assert model_cfg, "no model_cfg/enc_cfg found"
 
-    # Evaluation mode: disable temporal pooling
-    if "out_timesteps" in UltimateMEGEncoder.__init__.__code__.co_varnames:
+    EncoderCls = get_meg_encoder_class(meg_encoder)
+
+    # Evaluation mode: disable temporal pooling if supported
+    if "out_timesteps" in EncoderCls.__init__.__code__.co_varnames:
         model_cfg["out_timesteps"] = None
 
-    model = UltimateMEGEncoder(**model_cfg)
+    model = EncoderCls(**model_cfg)
 
     state = ckpt.get("state_dict", ckpt)
     new_state = {
@@ -325,6 +349,7 @@ def load_model_from_ckpt(ckpt_path: Path, run_dir: Path, device: str):
         log(f"[INFO] exp(logit_scale) in ckpt: {meta['logit_scale_exp']:.6f}")
 
     return model, meta
+
 
 
 @torch.no_grad()
@@ -591,9 +616,8 @@ def evaluate(args):
     log(f"[SUBJECT] loaded {len(subj_map)} subjects")
 
     ckpt_path = choose_ckpt_path(args)
-    model, meta = load_model_from_ckpt(ckpt_path, run_dir, device)
+    model, meta = load_model_from_ckpt(ckpt_path, run_dir, device, args.meg_encoder)
     scale = meta["logit_scale_exp"] if args.use_ckpt_logit_scale else None
-
     topk_list = [int(x) for x in args.topk.split(",")]
     recalls = {"base": {k: 0 for k in topk_list}, "post": {k: 0 for k in topk_list}}
     mrr_sum_base = 0.0
@@ -807,6 +831,12 @@ def parse_args():
     p.add_argument("--n_improved", type=int, default=6)
     p.add_argument("--n_unchanged", type=int, default=3)
     p.add_argument("--n_worsened", type=int, default=3)
+    p.add_argument(
+        "--meg_encoder",
+        default="dense",
+        choices=["dense", "exp"],
+        help="MEG encoder backbone: dense (UltimateMEGEncoder) or exp (ExpDilated)"
+    )
 
     return p.parse_args()
 

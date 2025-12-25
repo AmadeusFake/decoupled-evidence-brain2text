@@ -71,7 +71,7 @@ def choose_ckpt_path(run_dir: Path, ckpt_path: str, use_best_ckpt: bool) -> Path
     assert cp.exists(), f"--ckpt_path not found: {cp}"
     return cp
 
-from models.meg_encoder2 import UltimateMEGEncoder  # 和 eval 保持一致
+from models.meg_encoder_ExpDilated import UltimateMEGEncoder  # 和 eval 保持一致
 
 def _read_logit_scale_exp(ckpt_path: Path) -> Optional[float]:
     """

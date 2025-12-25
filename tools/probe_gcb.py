@@ -179,7 +179,7 @@ def choose_ckpt_path(args) -> Path:
     assert ckpt_path.exists(), f"--ckpt_path not found: {ckpt_path}"
     return ckpt_path
 
-from models.meg_encoder import UltimateMEGEncoder  # 依赖你的工程位置
+from models.meg_encoder_Dense import UltimateMEGEncoder  # 依赖你的工程位置
 
 def _read_logit_scale_exp(ckpt_path: Path) -> Optional[float]:
     sd = torch.load(ckpt_path, map_location="cpu")

@@ -113,6 +113,28 @@ def maybe_interp_1DT(x: torch.Tensor, T: int) -> torch.Tensor:
         align_corners=False
     ).squeeze(0)
 
+def get_meg_encoder_class(name: str):
+    """
+    Factory for selecting MEG encoder backbone.
+
+    Parameters
+    ----------
+    name : {"dense", "exp"}
+        Encoder variant.
+
+    Returns
+    -------
+    Encoder class (UltimateMEGEncoder).
+    """
+    name = name.lower()
+    if name == "dense":
+        from models.meg_encoder_Dense import UltimateMEGEncoder
+        return UltimateMEGEncoder
+    elif name == "exp":
+        from models.meg_encoder_ExpDilated import UltimateMEGEncoder
+        return UltimateMEGEncoder
+    else:
+        raise ValueError(f"Unknown meg_encoder: {name}")
 
 def window_centers(rows: List[dict], idxs: List[int]) -> torch.Tensor:
     """
@@ -303,9 +325,6 @@ def choose_ckpt_path(args) -> Path:
     return ckpt_path
 
 
-from models.meg_encoder2 import UltimateMEGEncoder
-
-
 def _read_logit_scale_exp(ckpt_path: Path) -> Optional[float]:
     """
     Attempt to extract exp(logit_scale) from checkpoint state dict.
@@ -324,16 +343,35 @@ def _read_logit_scale_exp(ckpt_path: Path) -> Optional[float]:
                 except Exception:
                     pass
     return None
-
-
 def load_model_from_ckpt(
     ckpt_path: Path,
     run_dir: Path,
-    device: str
-) -> Tuple[UltimateMEGEncoder, Dict[str, Any]]:
+    device: str,
+    meg_encoder: str,
+) -> Tuple[torch.nn.Module, Dict[str, Any]]:
     """
-    Load UltimateMEGEncoder from checkpoint and records config.
+    Load MEG encoder from checkpoint and records config, with selectable backbone.
+
+    Parameters
+    ----------
+    ckpt_path : Path
+        Lightning checkpoint path.
+    run_dir : Path
+        Run directory containing records/config.json.
+    device : str
+        Target device ("cpu" or "cuda").
+    meg_encoder : str
+        Encoder backbone selector: "dense" or "exp".
+
+    Returns
+    -------
+    model : torch.nn.Module
+        Instantiated encoder model loaded with state_dict (strict=False).
+    meta : Dict[str, Any]
+        Extra metadata (e.g., exp(logit_scale) if present in checkpoint).
     """
+    EncoderCls = get_meg_encoder_class(meg_encoder)
+
     model_cfg = load_cfg_from_records(run_dir)
     ckpt = torch.load(ckpt_path, map_location="cpu")
 
@@ -343,11 +381,11 @@ def load_model_from_ckpt(
 
     assert model_cfg, "No model_cfg / enc_cfg found"
 
-    # Evaluation: disable temporal pooling inside encoder
-    if "out_timesteps" in UltimateMEGEncoder.__init__.__code__.co_varnames:
+    # Evaluation: disable temporal pooling inside encoder (if supported)
+    if "out_timesteps" in EncoderCls.__init__.__code__.co_varnames:
         model_cfg["out_timesteps"] = None
 
-    model = UltimateMEGEncoder(**model_cfg)
+    model = EncoderCls(**model_cfg)
 
     state = ckpt.get("state_dict", ckpt)
     new_state = {
@@ -772,7 +810,15 @@ def evaluate(args):
     log(f"[SUBJECT] loaded {len(subj_map)} subjects")
 
     ckpt_path = choose_ckpt_path(args)
-    model, meta = load_model_from_ckpt(ckpt_path, run_dir, device)
+
+    # -------- ONLY CHANGE: pass args.meg_encoder --------
+    model, meta = load_model_from_ckpt(
+        ckpt_path=ckpt_path,
+        run_dir=run_dir,
+        device=device,
+        meg_encoder=args.meg_encoder,
+    )
+    # -----------------------------------------------
     scale = meta["logit_scale_exp"] if args.use_ckpt_logit_scale else None
 
     topk_list = [int(x) for x in args.topk.split(",")]
@@ -859,7 +905,6 @@ def evaluate(args):
     log("==== Retrieval Results ====")
     log(json.dumps(metrics, indent=2))
 
-
 # =============================================================================
 # CLI
 # =============================================================================
@@ -895,6 +940,12 @@ def parse_args():
     p.add_argument("--gcb_norm", default="bucket_sqrt")
     p.add_argument("--gcb_topS", type=int, default=3)
     p.add_argument("--gcb_gamma", type=float, default=0.7)
+    p.add_argument(
+        "--meg_encoder",
+        default="dense",
+        choices=["dense", "exp"],
+        help="MEG encoder backbone: dense or exp",
+    )
 
     p.add_argument("--use_ckpt_logit_scale", action="store_true")
     p.add_argument("--seed", type=int, default=None)

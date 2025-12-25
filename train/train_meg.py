@@ -45,7 +45,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.utilities import rank_zero_only
 
 # 你的模型（UltimateMEGEncoder）——这里用新的 SimpleConv 版本
-from models.meg_encoder2 import UltimateMEGEncoder
+from models.meg_encoder_ExpDilated import UltimateMEGEncoder
 # 如果你是覆盖了原来的 meg_encoder.py，请改成：
 # from models.meg_encoder import UltimateMEGEncoder
 
