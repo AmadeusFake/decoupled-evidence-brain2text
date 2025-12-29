@@ -3,18 +3,20 @@
 """
 Training script (paper-aligned + clean metrics/logging + subject registry)
 
-论文/官方实现对齐要点（本脚本所用）：
-- 单向对比（脑->语音），同 GPU 批内作为负样本
-- 两端线性插值到 T=360；**不做时间池化**（保留时序）
-- 打分方式：**仅 candidates（语音端）按 (C,T) 做 L2 归一化**，estimates（MEG 端）不归一化；
+Paper / reference-implementation alignment (used in this script)
+---------------------------------------------------------------
+- One-way contrastive objective (brain -> audio), in-batch negatives on the same GPU only.
+- Linearly interpolate both modalities to T=360; **no temporal pooling** (keep time dimension).
+- Scoring: **only candidates (audio side) are L2-normalized over (C,T)**; estimates (MEG side) are NOT normalized.
   logits[b, o] = < MEG_b , AUDIO_o / ||AUDIO_o||_2 >
-- 默认**无温度**；可通过 --loss_temp 打开可学习温度
-- 可选开关（默认关闭）：center（均值移除）、trim（时间裁切）
+- No temperature by default; enable learnable temperature via --loss_temp.
+- Optional toggles (off by default): center (mean removal), trim (time cropping).
 
-其它工程增强（不改训练逻辑）：
-1) SubjectRegistry：稳定被试索引（支持多数据集命名空间）
-2) 更清爽的日志与指标（Top-1/5/10、MRR、MeanRank）
-3) 导出 CSV/XLSX/PNG；控制台 epoch 表格
+Engineering improvements (does not change training logic)
+---------------------------------------------------------
+1) SubjectRegistry: stable subject indexing (supports multi-dataset namespaces).
+2) Cleaner logging & retrieval metrics (Top-1/5/10, MRR, MeanRank).
+3) Export CSV/XLSX/PNG; print an epoch-level console table.
 """
 
 import os
@@ -29,7 +31,7 @@ from typing import Dict, List, Any, Tuple, Iterable, Optional
 from collections import defaultdict
 import inspect
 
-# ---- Matplotlib 无显示后端（HPC 友好） ----
+# ---- Matplotlib headless backend (HPC-friendly) ----
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -44,8 +46,8 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.utilities import rank_zero_only
 
-# 你的模型（UltimateMEGEncoder）
-from models.meg_encoder import UltimateMEGEncoder
+# Model (UltimateMEGEncoder)
+from models.meg_encoder_ExpDilated import UltimateMEGEncoder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("train")
@@ -56,10 +58,11 @@ TARGET_T = 360  # 120 Hz * 3 s
 # ============================== Subject Registry ============================== #
 class SubjectRegistry:
     """
-    稳定的“被试 -> 索引”注册表，支持多数据集命名空间。
-    - 组合键： "<namespace>:<subject_id>"（namespace 为空则直接 subject_id）
-    - 构建：从若干 manifest（及各自 namespace）收集 subject_id 的并集，排序后稳定编号
-    - 持久化：save/load 到 JSON，复现实验、后续检索/评测时保证一致
+    Stable "subject -> index" registry with optional per-manifest namespaces.
+
+    - Composite key: "<namespace>:<subject_id>" (or just subject_id if namespace is empty).
+    - Build: collect the union of subject_id across manifests (with namespaces), sort, then assign stable indices.
+    - Persistence: save/load JSON so that training and downstream evaluation use exactly the same mapping.
     """
     def __init__(self, mapping: Dict[str, int] | None = None):
         self._map: Dict[str, int] = mapping or {}
@@ -80,7 +83,7 @@ class SubjectRegistry:
             return self._map[k]
         if not self._map:
             raise RuntimeError("SubjectRegistry is empty; cannot map subject.")
-        # 未登记的被试：不扩容模型，回退到第一个索引（影响极小）
+        # Unknown subject: do not expand the model; optionally fall back to index 0 (minimal impact in practice).
         if fallback_to_first:
             return 0
         raise KeyError(f"Unknown subject key: {k}")
@@ -146,7 +149,7 @@ class SubjectRegistry:
 
 # ============================== Data ============================== #
 def _ensure_CxT(x: np.ndarray) -> np.ndarray:
-    """将 2D 矩阵调整为“通道×时间”布局：MEG 通常 C≈270, T≈360，Heuristic：行数<=列数视为 [C,T]。"""
+    """Ensure a 2D array is in channel×time layout. Heuristic: if rows <= cols treat as [C,T], else transpose."""
     if x.ndim != 2:
         raise ValueError(f"Expect 2D [C,T] or [T,C], got {x.shape}")
     return x if x.shape[0] <= x.shape[1] else x.T
@@ -154,11 +157,11 @@ def _ensure_CxT(x: np.ndarray) -> np.ndarray:
 
 class MEGDataset(Dataset):
     """
-    读取 jsonl manifest（Stage-3 fully_preprocessed）：
-    - meg_win_path: 归一化+clamp 后的 [C,T] float32
-    - audio_feature_path: [1024,T] float32（Stage-2 已插值到 T=360；若不是360，这里与 loss 内部会插值）
-    - sensor_coordinates_path: [C,3] float32，x,y ∈ [0,1]，z=0
-    - subject_id: 标识被试（与 SubjectRegistry 的 namespace 组合成稳定键）
+    Reads a jsonl manifest (Stage-3 fully_preprocessed):
+    - meg_win_path: normalized + clamped [C,T] float32
+    - audio_feature_path: [1024,T] float32 (Stage-2 already interpolated to T=360; if not 360, we still handle it here/in loss)
+    - sensor_coordinates_path: [C,3] float32, x,y in [0,1], z=0
+    - subject_id: subject identifier (combined with namespace in SubjectRegistry to form a stable key)
     """
     def __init__(self, manifest_path: str, registry: SubjectRegistry, namespace: str, normalize: bool = False):
         super().__init__()
@@ -194,7 +197,7 @@ class MEGDataset(Dataset):
         meg = np.load(s["meg_win_path"]).astype(np.float32)
         meg = _ensure_CxT(meg)
         if self.normalize:
-            # 仅用于 ablation；论文路径默认不二次标准化（Stage-3 已 robust+clamp）
+            # Ablation-only; default pipeline does NOT re-standardize (Stage-3 already robust-normalized + clamped).
             m = meg.mean(axis=1, keepdims=True)
             sd = meg.std(axis=1, keepdims=True) + 1e-6
             meg = (meg - m) / sd
@@ -216,7 +219,7 @@ class MEGDataset(Dataset):
 
         item = {
             "meg_win": torch.from_numpy(meg),         # [C,T]
-            "audio_feature": torch.from_numpy(aud),   # [T,1024] or [1024,T]，loss 内处理
+            "audio_feature": torch.from_numpy(aud),   # [T,1024] or [1024,T] (corrected inside loss)
             "sensor_locs": torch.from_numpy(coords),  # [C,3]
             "subject_idx": torch.tensor(subj_idx, dtype=torch.long),
             "key": s.get("window_id", s.get("audio_key", "")),
@@ -254,7 +257,7 @@ class MEGDataModule(pl.LightningDataModule):
                 col[k].append(v)
 
         meg = torch.stack(col["meg_win"], dim=0)       # [B,C,T]
-        aud = torch.stack(col["audio_feature"], dim=0) # [B,?,?]（loss 内纠正为 [B,D,T]）
+        aud = torch.stack(col["audio_feature"], dim=0) # [B,?,?] (corrected inside loss to [B,D,T])
         loc = torch.stack(col["sensor_locs"], dim=0)   # [B,C,3]
         sid = torch.stack(col["subject_idx"], dim=0)   # [B]
         keys = col["key"]
@@ -280,19 +283,20 @@ class MEGDataModule(pl.LightningDataModule):
 # ============================== Paper-aligned Loss ============================== #
 class PaperClipLoss(nn.Module):
     """
-    论文/官方对齐版对比损失（单向：脑->语音）
-    - 仅同 GPU 批内为负样本
-    - 对比前按线性插值到 T=360
-    - **仅 candidates（语音端）做 L2 归一化**（按 (C,T)），MEG 端不归一化
-    - **不做时间池化**（保留时序）；可选：center/trim（默认关闭）
-    - 默认无温度；如需可通过 --loss_temp 打开（learnable）
+    Paper-aligned contrastive loss (one-way: brain -> audio)
+    - In-batch negatives on the same GPU.
+    - Linear interpolation to T=360 before scoring.
+    - **Only candidates (audio) are L2-normalized** over (C,T); MEG estimates are NOT normalized.
+    - **No temporal pooling** (keep time dimension).
+    - Optional: center / trim (off by default).
+    - No temperature by default; enable learnable temperature via --loss_temp.
     """
     def __init__(
         self,
         target_T: int = TARGET_T,
-        pool: bool = False,          # 保持 False（不池化）
-        center: bool = False,        # 默认关闭（可复现实验时再开）
-        trim_min: int | None = None, # 默认不裁剪
+        pool: bool = False,          # Keep False (no pooling)
+        center: bool = False,        # Off by default (enable only for ablations)
+        trim_min: int | None = None, # No trimming by default
         trim_max: int | None = None,
         use_temperature: bool = False,
         init_temp: float = 0.07,
@@ -310,41 +314,41 @@ class PaperClipLoss(nn.Module):
 
     @staticmethod
     def _to_BCT(x: torch.Tensor) -> torch.Tensor:
-        # 接受 [B,D,T] 或 [B,T,D]；返回 [B,C(=D),T]
+        # Accept [B,D,T] or [B,T,D]; return [B,C(=D),T].
         if x.dim() != 3:
             raise ValueError(f"Expect 3D, got {tuple(x.shape)}")
         B, A, C = x.shape
         return x if A >= C else x.transpose(1, 2).contiguous()
 
     def _prep(self, x: torch.Tensor) -> torch.Tensor:
-        # 统一到 [B,C,T] 并插值到 target_T；可选裁剪/池化/均值移除
+        # Convert to [B,C,T] and interpolate to target_T; optional trim/pool/center.
         x = self._to_BCT(x.to(torch.float32))
         if x.size(-1) != self.target_T:
             x = F.interpolate(x, size=self.target_T, mode="linear", align_corners=False)
-        # 裁剪（样本点索引）
+        # Optional trimming (time indices).
         if (self.trim_min is not None) or (self.trim_max is not None):
             t0 = 0 if self.trim_min is None else max(0, int(self.trim_min))
             t1 = x.size(-1) if self.trim_max is None else min(x.size(-1), int(self.trim_max))
             x = x[..., t0:t1]
         if self.pool:
-            x = x.mean(dim=2, keepdim=True)  # 不建议开：会丢时序
+            x = x.mean(dim=2, keepdim=True)  # Not recommended: discards temporal information.
         if self.center:
             x = x - x.mean(dim=(1, 2), keepdim=True)
         return x
 
     def forward(self, meg_f: torch.Tensor, aud_f: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        # 1) 预处理（插值/可选裁剪/可选中心化）
+        # 1) Preprocess (interpolate / optional trim / optional centering)
         m = self._prep(meg_f)  # estimates:  [B,C,T']
         a = self._prep(aud_f)  # candidates: [B,C,T']
 
-        # 2) 仅 candidates 做 L2 归一化（按 (C,T)）
+        # 2) L2-normalize candidates only, over (C,T)
         inv_norms = (a.norm(dim=(1, 2), p=2) + 1e-8).reciprocal()  # [B]
 
-        # 3) 打分：与官方 ClipLoss 等价的 einsum 写法
+        # 3) Scoring: einsum form matching the reference implementation
         #    logits[b, o] = sum_{c,t} m[b,c,t] * ( a[o,c,t] / ||a[o]|| )
         logits = torch.einsum("bct,oct,o->bo", m, a, inv_norms)
 
-        # 4) 可选温度（默认关闭；开启时与常见 CLIP 一致）
+        # 4) Optional temperature (off by default; CLIP-style when enabled)
         if self.logit_scale is not None:
             logits = logits * self.logit_scale.exp().clamp(max=100.0)
 
@@ -357,15 +361,15 @@ class PaperClipLoss(nn.Module):
 @torch.no_grad()
 def batch_retrieval_metrics(logits: torch.Tensor, ks=(1, 5, 10)) -> Dict[str, float]:
     """
-    基于 batch 内 logits（[B,B]，行=MEG，列=Audio）计算检索指标。
-    返回：{'top1':..., 'top5':..., 'top10':..., 'mrr':..., 'mean_rank':...}
+    Compute retrieval metrics from in-batch logits ([B,B], rows=MEG queries, cols=audio candidates).
+    Returns: {'top1','top5','top10','mrr','mean_rank'}.
     """
     B = logits.size(0)
     device = logits.device
     ks = tuple(int(k) for k in ks if k >= 1)
     ks = tuple(k for k in ks if k <= B)
     preds = logits.argsort(dim=1, descending=True)           # [B,B]
-    inv = preds.argsort(dim=1)                               # [B,B] 逆置换
+    inv = preds.argsort(dim=1)                               # [B,B] inverse permutation
     tgt = torch.arange(B, device=device)
     ranks = inv[torch.arange(B, device=device), tgt]         # [B] 0-based
     ranks_float = ranks.to(torch.float32)
@@ -443,9 +447,9 @@ class MetricLogger:
 
     @rank_zero_only
     def export_tables_and_plots(self):
-        """把 JSONL 汇总为 CSV/XLSX，并画 PNG 曲线（loss、lr、Top1）"""
+        """Aggregate JSONL into CSV/XLSX, and save PNG curves (loss, lr, Top1)."""
         import csv
-        # CSV
+        # CSV export
         step_csv = self.run_dir / "metrics_step.csv"
         epoch_csv = self.run_dir / "metrics_epoch.csv"
         if self._step_records:
@@ -457,7 +461,7 @@ class MetricLogger:
             with open(epoch_csv, "w", newline="", encoding="utf-8") as f:
                 w = csv.DictWriter(f, fieldnames=keys); w.writeheader(); w.writerows(self._epoch_records)
 
-        # XLSX（若缺依赖，自动跳过）
+        # XLSX export (optional dependency; skip if unavailable)
         try:
             import pandas as pd
             step_xlsx = self.run_dir / "metrics_step.xlsx"
@@ -469,7 +473,7 @@ class MetricLogger:
         except Exception as e:
             logger.warning(f"XLSX export skipped: {e}")
 
-        # 画图：loss（epoch） & lr（step） & Top-1（epoch）
+        # Plots: loss (epoch) & lr (step) & Top-1 (epoch)
         try:
             epochs = [r["epoch"] for r in self._epoch_records]
             tr = [r.get("train_loss") for r in self._epoch_records]
@@ -515,14 +519,16 @@ class MEGLitModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["metric_logger"])
 
-        # —— 兼容新/旧 Encoder：新版没有 out_timesteps；旧版若有则传 None 以保持“不池化” —— #
+        # Compatibility with new/old encoder:
+        # - New versions do not have out_timesteps
+        # - Old versions accept out_timesteps; set None to enforce "no temporal pooling"
         enc_sig = inspect.signature(UltimateMEGEncoder).parameters
         enc_cfg = dict(model_cfg)
         if "out_timesteps" in enc_sig:
-            enc_cfg["out_timesteps"] = None  # 训练阶段严格按论文：不做时间池化
+            enc_cfg["out_timesteps"] = None  # strictly paper-aligned: no temporal pooling during training
         self.model = UltimateMEGEncoder(**enc_cfg)
 
-        # 论文对齐：单向、候选端 L2 归一化、默认无温度、不池化
+        # Paper-aligned defaults: one-way; candidate-only L2; no temperature; no pooling
         if loss_use_l2:
             logger.warning("`--loss_l2` 将被忽略：论文路径仅做候选端（语音）L2 归一化，已内置。")
         self.loss_fn = PaperClipLoss(
@@ -542,12 +548,12 @@ class MEGLitModule(pl.LightningModule):
         self.metric_logger = metric_logger
         self.metrics_every_n_steps = max(1, int(metrics_every_n_steps))
 
-        # 缓存当 epoch 的 loss & metrics
+        # Cache per-epoch losses & metrics
         self._train_epoch_losses: List[float] = []
         self._val_epoch_losses: List[float] = []
         self._best_val: float | None = None
 
-        # 累积 epoch 级检索指标
+        # Accumulate epoch-level retrieval metrics
         self._train_metric_sums: Dict[str, float] = defaultdict(float)
         self._train_metric_count: int = 0
         self._val_metric_sums: Dict[str, float] = defaultdict(float)
@@ -555,7 +561,7 @@ class MEGLitModule(pl.LightningModule):
 
     # -------------- helpers -------------- #
     def forward(self, batch):
-        # 仅本地基线：不传任何上下文相关参数
+        # Local baseline only: do not pass any context-related arguments.
         return self.model(
             meg_win=batch["meg_win"],
             sensor_locs=batch["sensor_locs"],
@@ -563,7 +569,7 @@ class MEGLitModule(pl.LightningModule):
         )
 
     def _assert_T(self, y: torch.Tensor):
-        # 保险：只要求特征维=1024；时间维由损失内部插值到 360
+        # Safety check: only require feature dim=1024; time dim is interpolated to 360 inside the loss.
         assert y.dim() == 3 and y.size(1) == 1024, \
             f"Encoder must output [B,1024,T], got {tuple(y.shape)}"
 
@@ -598,11 +604,11 @@ class MEGLitModule(pl.LightningModule):
         loss, logits = self.loss_fn(meg_feat, batch["audio"])
         self._train_epoch_losses.append(loss.detach().item())
 
-        # 批级检索指标（每步累积；按频率写 step 日志）
+        # Per-batch retrieval metrics (accumulate each step; write step logs at a chosen frequency)
         metrics = batch_retrieval_metrics(logits.detach(), ks=(1, 5, 10))
         self._accumulate_metrics(self._train_metric_sums, metrics, counter_name="train")
 
-        # step 级 JSONL（抽样写）
+        # Step-level JSONL logging (subsampled)
         if self.metric_logger is not None:
             if (int(self.global_step) % self.metrics_every_n_steps) == 0:
                 lr = None
@@ -614,7 +620,7 @@ class MEGLitModule(pl.LightningModule):
                 self.metric_logger.write_step("train_step", int(self.global_step), int(self.current_epoch),
                                               float(loss.detach().item()), lr, metrics)
 
-        # Lightning 日志（用于进度条）
+        # Lightning logging (progress bar)
         self.log("train/loss", loss, prog_bar=True, on_step=True, on_epoch=True, batch_size=batch["meg_win"].size(0))
         return loss
 
@@ -652,7 +658,7 @@ class MEGLitModule(pl.LightningModule):
         return "n/a" if x is None else f"{x:.4f}"
 
     def on_validation_epoch_end(self):
-        # 均值
+        # Epoch means
         tr = np.mean(self._train_epoch_losses).item() if self._train_epoch_losses else None
         va = np.mean(self._val_epoch_losses).item() if self._val_epoch_losses else None
         if va is not None:
@@ -662,7 +668,7 @@ class MEGLitModule(pl.LightningModule):
         tr_metrics = self._avg_metrics(self._train_metric_sums, self._train_metric_count)
         va_metrics = self._avg_metrics(self._val_metric_sums, self._val_metric_count)
 
-        # JSONL（epoch）
+        # Epoch JSONL
         if self.metric_logger is not None:
             self.metric_logger.write_epoch(
                 epoch=int(self.current_epoch),
@@ -670,7 +676,7 @@ class MEGLitModule(pl.LightningModule):
                 train_metrics=tr_metrics, val_metrics=va_metrics
             )
 
-        # 控制台对齐表格
+        # Console summary table
         hdr = f"[Epoch {int(self.current_epoch):03d}]"
         line1 = f"{hdr} train_loss={self._fmt4(tr)} | val_loss={self._fmt4(va)} | best_val={self._fmt4(self._best_val)}"
         def mget(d, k): return None if not d else d.get(k)
@@ -688,13 +694,13 @@ class MEGLitModule(pl.LightningModule):
 
     # -------------- optim -------------- #
     def configure_optimizers(self):
-        # 选择优化器
+        # Optimizer selection
         if self.optimizer_name.lower() == "adam":
             optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
         else:
             optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
-        # 余弦+warmup 学习率
+        # Cosine schedule with warmup
         def lr_lambda(step: int):
             max_steps = max(1, self.trainer.estimated_stepping_batches)
             warmup = int(self.warmup_ratio * max_steps)
@@ -709,7 +715,7 @@ class MEGLitModule(pl.LightningModule):
 
 # ============================== Utils ============================== #
 def map_amp_to_precision(amp: str) -> str | int:
-    """把命令行参数 --amp 映射到 Lightning 的 precision 选项"""
+    """Map command-line --amp to Lightning 'precision'."""
     amp = amp.lower()
     if amp in ("off", "none", "32", "fp32"):
         return 32  # FP32
@@ -750,20 +756,20 @@ def save_records(run_dir: Path, cfg: dict, best_ckpt_path: str | None, subject_m
 def parse_args():
     p = argparse.ArgumentParser()
 
-    # 数据
+    # Data
     p.add_argument("--train_manifest", required=True, type=str)
     p.add_argument("--val_manifest", required=True, type=str)
     p.add_argument("--test_manifest", required=True, type=str)
 
-    # 多数据集命名空间（可选；默认空串）
+    # Multi-dataset namespaces (optional; default empty)
     p.add_argument("--subject_namespace_train", type=str, default="", help="给 train manifest 中的 subject 加命名空间前缀")
     p.add_argument("--subject_namespace_val",   type=str, default="", help="给 val manifest 中的 subject 加命名空间前缀")
     p.add_argument("--subject_namespace_test",  type=str, default="", help="给 test manifest 中的 subject 加命名空间前缀")
 
-    # 持久化/复现：被试映射
+    # Persistence / reproduction: subject mapping
     p.add_argument("--subject_mapping_path", type=str, default="", help="若存在则加载；否则用 train/val/test 联合集合构建并保存到此路径")
 
-    # 批量/并行/精度
+    # Batch / parallelism / precision
     p.add_argument("--batch_size", type=int, default=64)
     p.add_argument("--accumulate_grad_batches", type=int, default=1)
     p.add_argument("--gpus", type=int, default=1, help="与 --devices 等价；保留兼容 sbatch")
@@ -771,7 +777,7 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=8)
     p.add_argument("--amp", type=str, default="off", choices=["off", "bf16", "16-mixed", "fp16", "32"])
 
-    # 优化 & 日程
+    # Optimization & schedule
     p.add_argument("--optimizer", type=str, default="adamw", choices=["adam", "adamw"])
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight_decay", type=float, default=0.0)
@@ -780,11 +786,11 @@ def parse_args():
     p.add_argument("--gradient_clip_val", type=float, default=0.0)
     p.add_argument("--early_stop_patience", type=int, default=15)
 
-    # LR 线性缩放参考
+    # LR linear scaling reference
     p.add_argument("--base_bsz_for_lr", type=int, default=256,
                    help="若与论文等效，设置为 256；实际 lr 会按 effective_bsz/base_bsz 线性缩放")
 
-    # 模型
+    # Model
     p.add_argument("--in_channels", type=int, default=270)
     p.add_argument("--n_subjects", type=int, default=None, help="若不指定，自动由 registry 推断")
     p.add_argument("--spatial_channels", type=int, default=270)
@@ -797,20 +803,20 @@ def parse_args():
     p.add_argument("--spatial_dropout_p", type=float, default=0.0)
     p.add_argument("--spatial_dropout_radius", type=float, default=0.2)
 
-    # 其它
+    # Misc
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--default_root_dir", type=str, default="runs")
     p.add_argument("--experiment_name", type=str, default="exp")
     p.add_argument("--normalize", action="store_true", help="若指定，则在加载时再做 z-score（默认关闭）")
 
-    # Loss 可选开关
+    # Loss toggles
     p.add_argument("--loss_l2", action="store_true", help="（已忽略）若指定也会 WARNING：论文路径仅候选端 L2 归一化")
     p.add_argument("--loss_temp", action="store_true", help="使用可学习温度（默认否）")
 
-    # 步级日志频率
+    # Step-level logging frequency
     p.add_argument("--metrics_every_n_steps", type=int, default=50)
 
-    # 兼容你命令行的冗余参数（当前不使用）
+    # Unused placeholder (kept for CLI compatibility)
     p.add_argument("--steps_per_epoch", type=int, default=0, help="占位参数，当前不启用")
 
     return p.parse_args()
@@ -819,7 +825,7 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # 建议打开 A100 的 TF32/高精度 matmul（性能更好）
+    # Recommend enabling TF32 / high matmul precision on A100 for better throughput.
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:
@@ -827,18 +833,18 @@ def main():
 
     pl.seed_everything(args.seed, workers=True)
 
-    # 设备/精度
+    # Device / precision
     precision = map_amp_to_precision(args.amp)
     devices = args.devices if args.devices is not None else args.gpus
     devices = max(1, int(devices))
 
-    # 运行目录 & 记录器
+    # Run directory & metric logger
     run_dir = build_run_dir(args.experiment_name, args.default_root_dir)
     metric_logger = MetricLogger(run_dir)
     records_dir = run_dir / "records"
     records_dir.mkdir(parents=True, exist_ok=True)
 
-    # ========= Subject Registry：加载或构建 ========= #
+    # ========= Subject Registry: load or build ========= #
     train_p = Path(args.train_manifest)
     val_p   = Path(args.val_manifest)
     test_p  = Path(args.test_manifest)
@@ -871,10 +877,10 @@ def main():
     )
     dm.setup(None)
 
-    # 推断 n_subjects：默认采用 registry 大小（覆盖 train/val/test 的并集）
+    # n_subjects defaults to registry size (union across train/val/test)
     n_subjects = args.n_subjects if args.n_subjects is not None else max(1, registry.num_subjects)
 
-    # 模型 cfg（严格基线：不传任何 context 相关参数）
+    # Model config (strict baseline: do not include any context-related params)
     model_cfg = dict(
         in_channels=args.in_channels,
         n_subjects=n_subjects,
@@ -889,7 +895,7 @@ def main():
         backbone_type=args.backbone_type,
     )
 
-    # 有效 batch & LR 线性缩放
+    # Effective batch size & LR linear scaling
     effective_bsz = args.batch_size * args.accumulate_grad_batches * devices
     scaled_lr = args.lr * (effective_bsz / max(1, args.base_bsz_for_lr))
     logger.info(f"train.jsonl loaded: {len(dm.train_set):,} samples")
@@ -907,12 +913,12 @@ def main():
         max_epochs=args.max_epochs,
         optimizer_name=args.optimizer,
         metric_logger=metric_logger,
-        loss_use_l2=args.loss_use_l2 if hasattr(args, "loss_use_l2") else False,  # 兼容
+        loss_use_l2=args.loss_use_l2 if hasattr(args, "loss_use_l2") else False,  # CLI compatibility
         loss_use_temp=args.loss_temp,
         metrics_every_n_steps=args.metrics_every_n_steps
     )
 
-    # 保存配置（供复现实验使用）
+    # Save config snapshot (for reproducibility)
     cfg_to_save = {
         "args": vars(args),
         "model_cfg": model_cfg,
@@ -952,17 +958,17 @@ def main():
     try:
         trainer.fit(lit, datamodule=dm)
     finally:
-        # 不管是否中断，都导出当前已有的表格与图
+        # Always export any accumulated tables/plots, even if training is interrupted.
         metric_logger.export_tables_and_plots()
 
-    # 写 best ckpt 路径
+    # Write best checkpoint path
     best_path = ckpt_cb.best_model_path
     if not best_path:
         last = (run_dir / "checkpoints" / "last.ckpt")
         best_path = str(last) if last.exists() else ""
     save_records(run_dir, cfg_to_save, best_ckpt_path=best_path, subject_map_path=str(map_path), registry=registry)
 
-    # Test（使用 best ckpt）
+    # Test using best checkpoint
     trainer.test(lit, datamodule=dm, ckpt_path="best")
     metric_logger.export_tables_and_plots()
     metric_logger.close()

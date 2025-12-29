@@ -1,12 +1,44 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-EEG Training script (MEG-style encoder)
+EEG training script using a MEG-style encoder backbone.
 
-- 数据：仍然是 EEGDataModule（从 eeg_win_path / sensor_coordinates_path 读取）。
-- 模型：复用 models.meg_encoder.UltimateMEGEncoder（局部分支，本质是 MEG encoder 风格）。
-- Loss：PaperClipLoss，使用 Fixed Temperature（init_temp=0.07 -> scale≈14.3）。
-- 去掉 Matplotlib，改用 CSV 记录，避免 HPC 上崩溃/卡死。
+Purpose
+-------
+This script trains a window-level brain-to-audio-feature retrieval model using EEG windows,
+while *reusing* the MEG-style UltimateMEGEncoder implementation.
+
+Key design choices (for reproducibility)
+----------------------------------------
+1) Data: EEGDataModule
+   - Loads brain windows from one of: {meg_win_path, eeg_win_path, brain_win_path}
+   - Loads sensor positions from sensor_coordinates_path
+   - Loads paired audio features from audio_feature_path
+
+2) Model: models.meg_encoder.UltimateMEGEncoder
+   - We intentionally reuse the MEG-style encoder architecture for EEG experiments.
+   - Only the local branch is used (context_mode="none").
+
+3) Loss: PaperClipLoss (fixed-temperature CLIP-style loss by default)
+   - init_temp=0.07 → exp(logit_scale) ≈ 14.3
+   - Optionally, set --loss_temp to learn temperature
+
+4) Logging: JSONL + CSV (no Matplotlib)
+   - Avoids plotting dependencies and potential crashes on headless/HPC environments.
+   - Writes:
+       runs/<run_name>/metrics_step.jsonl, metrics_epoch.jsonl
+       runs/<run_name>/metrics_step.csv,  metrics_epoch.csv
+
+Outputs
+-------
+- Run folder: runs/<experiment_name>_<timestamp>[_job<SLURM_JOB_ID>]
+- records/:
+    config.json
+    best_checkpoint.txt
+    subject_mapping.json (or user-provided mapping)
+    subject_mapping_snapshot.json
+- checkpoints/:
+    last.ckpt and per-epoch checkpoints (save_top_k=-1)
 """
 
 import os, json, math, argparse, logging, inspect, csv
@@ -25,17 +57,33 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.utilities import rank_zero_only
 
-# 直接复用 MEG-style UltimateMEGEncoder
-from models.meg_encoder import UltimateMEGEncoder
+# Dense encoder for EEG encoding
+from models.meg_encoder_Dense import UltimateMEGEncoder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger("train_eeg")
 
+# Target temporal length used throughout the pipeline:
+# 120 Hz * 3 s = 360 timesteps (matches the evaluation/probing scripts in this repo).
 TARGET_T = 360  # 120 Hz * 3 s
 
 
 # ============================== Subject Registry ============================== #
 class SubjectRegistry:
+    """
+    A stable mapping from (namespace, subject_id) → integer index.
+
+    Why this exists
+    ---------------
+    - Different datasets/splits may reuse the same subject_id strings.
+    - Namespacing avoids collisions when combining multiple sources.
+    - The mapping is persisted to disk to ensure exact reproducibility across runs.
+
+    Notes
+    -----
+    - If an unseen subject is encountered at runtime, we optionally fallback to index 0
+      (useful when some samples miss subject metadata).
+    """
     def __init__(self, mapping: Dict[str, int] | None = None):
         self._map: Dict[str, int] = mapping or {}
         self._order: List[str] = [k for k, _ in sorted(self._map.items(), key=lambda kv: kv[1])]
@@ -56,6 +104,8 @@ class SubjectRegistry:
         if not self._map:
             raise RuntimeError("SubjectRegistry is empty; cannot map subject.")
         if fallback_to_first:
+            # Fallback behavior: map unknown subject to first entry.
+            # This keeps training running even if a few rows have missing/novel subject IDs.
             return 0
         raise KeyError(f"Unknown subject key: {k}")
 
@@ -86,6 +136,7 @@ class SubjectRegistry:
 
     @staticmethod
     def _collect_subjects_from_manifest(manifest_path: Path) -> List[str]:
+        # Reads a JSONL manifest and collects unique subject_id strings.
         subs = set()
         with open(manifest_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -102,6 +153,7 @@ class SubjectRegistry:
 
     @classmethod
     def build_from_manifests(cls, files_with_ns: Iterable[Tuple[Path, str]]) -> "SubjectRegistry":
+        # Builds a union mapping across multiple manifests, using namespaces to avoid collisions.
         entries: List[str] = []
         for p, ns in files_with_ns:
             if not p or not p.exists():
@@ -116,11 +168,19 @@ class SubjectRegistry:
 
 # ============================== Data ============================== #
 def _ensure_brain_CxT(x: np.ndarray) -> np.ndarray:
+    """
+    Ensure brain window shape is [C, T].
+    Accepts [C, T] or [T, C] and returns [C, T].
+    """
     if x.ndim != 2:
         raise ValueError(f"Expect 2D [C,T] or [T,C], got {x.shape}")
     return x if x.shape[0] <= x.shape[1] else x.T
 
 def _ensure_audio_CxT(x: np.ndarray) -> np.ndarray:
+    """
+    Ensure audio feature shape is [1024, T].
+    Accepts [1024, T] or [T, 1024] and returns [1024, T].
+    """
     if x.ndim != 2:
         raise ValueError(f"Audio must be 2D, got {x.shape}")
     if x.shape[0] == 1024:
@@ -130,6 +190,21 @@ def _ensure_audio_CxT(x: np.ndarray) -> np.ndarray:
     return x if x.shape[0] < x.shape[1] else x.T
 
 class EEGDataset(Dataset):
+    """
+    Dataset reading JSONL manifests.
+
+    Each row must contain:
+    - audio_feature_path: npy array of shape [1024,T] (or [T,1024])
+    - sensor_coordinates_path: npy array of shape [C,2] or [C,3]
+    - one of: meg_win_path / eeg_win_path / brain_win_path: npy array [C,T] (or [T,C])
+    - subject_id: (optional but recommended) used for subject embedding
+
+    Returns a dict with:
+    - meg_win:      torch.FloatTensor [C,T]   (brain window; key name kept as "meg_win" for model API consistency)
+    - audio_feature torch.FloatTensor [1024,T]
+    - sensor_locs:  torch.FloatTensor [C,3]
+    - subject_idx:  torch.LongTensor scalar
+    """
     def __init__(self, manifest_path: str, registry: SubjectRegistry, namespace: str, normalize: bool = False):
         super().__init__()
         self.manifest_path = Path(manifest_path)
@@ -139,6 +214,7 @@ class EEGDataset(Dataset):
         with open(self.manifest_path, "r", encoding="utf-8") as f:
             self.samples = [json.loads(l) for l in f if l.strip()]
 
+        # Defensive filtering: drop rows that miss sensor_coordinates_path (required by the encoder).
         before = len(self.samples)
         self.samples = [s for s in self.samples if Path(s.get("sensor_coordinates_path", "")).exists()]
         drop = before - len(self.samples)
@@ -148,6 +224,8 @@ class EEGDataset(Dataset):
         self.registry = registry
         self.namespace = (namespace or "").strip()
         self.normalize = normalize
+
+        # Cache sensor coords per file path to reduce repeated disk IO.
         self._coords_cache: Dict[str, np.ndarray] = {}
 
         seen = sorted({s.get("subject_id") for s in self.samples if s.get("subject_id") is not None})
@@ -156,6 +234,7 @@ class EEGDataset(Dataset):
 
     @staticmethod
     def _get_brain_path(s: dict) -> str:
+        # Support multiple key names so the same dataset class works across EEG/MEG manifests.
         return s.get("meg_win_path") or s.get("eeg_win_path") or s.get("brain_win_path") or ""
 
     def __len__(self): return len(self.samples)
@@ -167,17 +246,21 @@ class EEGDataset(Dataset):
         if not brain_path:
             raise KeyError("Missing meg_win_path/eeg_win_path/brain_win_path in sample.")
         
+        # Brain window: [C,T]
         brain = np.load(brain_path).astype(np.float32)
         brain = _ensure_brain_CxT(brain)
 
+        # Optional per-channel standardization (within each window).
         if self.normalize:
             m = brain.mean(axis=1, keepdims=True)
             sd = np.maximum(brain.std(axis=1, keepdims=True), 1e-6)
             brain = (brain - m) / sd
 
+        # Audio feature: [1024,T]
         aud = np.load(s["audio_feature_path"]).astype(np.float32)
         aud = _ensure_audio_CxT(aud)
 
+        # Sensor coordinates: [C,3]
         coord_path = s.get("sensor_coordinates_path", "")
         if not coord_path or not Path(coord_path).exists():
             raise RuntimeError("Missing sensor_coordinates_path.")
@@ -185,16 +268,19 @@ class EEGDataset(Dataset):
             coords = self._coords_cache[coord_path]
         else:
             coords = np.load(coord_path).astype(np.float32)
+            # Allow 2D coords and promote to 3D by padding zeros (z=0).
             if coords.ndim == 2 and coords.shape[1] == 2:
                 coords = np.concatenate([coords, np.zeros((coords.shape[0], 1), dtype=np.float32)], axis=1)
             elif coords.ndim != 2 or coords.shape[1] not in (2, 3):
                 raise RuntimeError(f"Unexpected sensor_locs shape: {coords.shape}")
             self._coords_cache[coord_path] = coords
 
+        # Subject index lookup (namespace-aware).
         sid_str = str(s.get("subject_id"))
         subj_idx = self.registry.index_of(self.namespace, sid_str, fallback_to_first=True)
 
         return {
+            # Keep key name "meg_win" because UltimateMEGEncoder expects meg_win in forward().
             "meg_win": torch.from_numpy(brain),        # [C,T]
             "audio_feature": torch.from_numpy(aud),    # [1024,T]
             "sensor_locs": torch.from_numpy(coords),   # [C,3]
@@ -204,6 +290,17 @@ class EEGDataset(Dataset):
 
 
 class EEGDataModule(pl.LightningDataModule):
+    """
+    Lightning DataModule wrapper.
+
+    Notes
+    -----
+    - Uses a custom collate function to batch:
+        meg_win      -> [B,C,T]
+        audio_feature-> [B,1024,T]
+        sensor_locs  -> [B,C,3]
+        subject_idx  -> [B]
+    """
     def __init__(self,
                  train_manifest: str, val_manifest: str, test_manifest: str,
                  registry: SubjectRegistry,
@@ -227,6 +324,7 @@ class EEGDataModule(pl.LightningDataModule):
         self.test_set  = EEGDataset(self.test_manifest,  registry=self.registry, namespace=self.ns_test,  normalize=self.normalize)
 
     def _collate(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+        # Collect per-field lists then stack into tensors.
         col = defaultdict(list)
         for b in batch:
             for k, v in b.items():
@@ -257,6 +355,26 @@ class EEGDataModule(pl.LightningDataModule):
 
 # ============================== Paper-aligned Loss (FIXED) ============================== #
 class PaperClipLoss(nn.Module):
+    """
+    CLIP-style cross-entropy loss over in-batch negatives.
+
+    Inputs
+    ------
+    - meg_f: [B, 1024, T']  brain encoder output
+    - aud_f: [B, 1024, T']  paired audio features
+
+    Behavior
+    --------
+    - Resizes both to target_T (default 360) via linear interpolation
+    - Flattens across channel & time, L2-normalizes per sample
+    - Computes logits = (m_norm @ a_norm^T) * exp(logit_scale)
+    - Cross-entropy target is diagonal (matching pairs)
+
+    Temperature
+    -----------
+    - By default, temperature is FIXED (buffer) with init_temp=0.07
+    - If use_temperature=True, logit_scale is learnable (Parameter)
+    """
     def __init__(self, target_T: int = TARGET_T, pool: bool = False,
                  center: bool = False, trim_min: int | None = None, trim_max: int | None = None,
                  use_temperature: bool = False, init_temp: float = 0.07):
@@ -267,7 +385,7 @@ class PaperClipLoss(nn.Module):
         self.trim_min = trim_min
         self.trim_max = trim_max
         
-        # init_temp = 0.07 => scale ~14.3
+        # init_temp = 0.07 => exp(logit_scale) ~= 14.3
         val = math.log(1.0 / init_temp)
         if use_temperature:
             self.logit_scale = nn.Parameter(torch.tensor(val, dtype=torch.float32))
@@ -286,15 +404,19 @@ class PaperClipLoss(nn.Module):
         m = self._resize(meg_f)
         a = self._resize(aud_f)
         
+        # Flatten time and channels: [B, 1024*T]
         m_flat = m.reshape(m.size(0), -1)
         a_flat = a.reshape(a.size(0), -1)
         
+        # L2 normalize per sample
         m_norm = F.normalize(m_flat, p=2, dim=1, eps=1e-6)
         a_norm = F.normalize(a_flat, p=2, dim=1, eps=1e-6)
 
+        # Similarity logits with (fixed or learnable) temperature
         scale = self.logit_scale.exp().clamp(max=100.0)
         logits = torch.matmul(m_norm, a_norm.T) * scale
             
+        # Ground-truth is the diagonal
         tgt = torch.arange(logits.size(0), device=logits.device)
         loss = F.cross_entropy(logits, tgt)
         return loss, logits
@@ -303,6 +425,17 @@ class PaperClipLoss(nn.Module):
 # ============================== Metrics utils ============================== #
 @torch.no_grad()
 def batch_retrieval_metrics(logits: torch.Tensor, ks=(1, 5, 10)) -> Dict[str, float]:
+    """
+    Standard retrieval metrics computed within the current batch.
+
+    logits: [B,B] similarity matrix (query i vs. candidate j)
+    Target: j == i (diagonal)
+
+    Returns:
+    - topk accuracy for k in ks
+    - MRR
+    - mean rank
+    """
     B = logits.size(0); device = logits.device
     ks = tuple(int(k) for k in ks if 1 <= k <= B)
     preds = logits.argsort(dim=1, descending=True)
@@ -321,6 +454,13 @@ def _fmt_pct(x: float | None) -> str:
 
 # ============================== Logger (No Matplotlib) ============================== #
 class MetricLogger:
+    """
+    Lightweight metric logger that writes JSONL during training and exports CSV at the end.
+
+    Why JSONL + CSV?
+    - JSONL is append-friendly and robust on HPC.
+    - CSV export makes quick plotting/analysis easy without requiring Matplotlib at runtime.
+    """
     def __init__(self, run_dir: Path):
         self.run_dir = run_dir
         self.step_log = self.run_dir / "metrics_step.jsonl"
@@ -371,6 +511,7 @@ class MetricLogger:
 
     @rank_zero_only
     def export_tables(self):
+        # Export buffered JSONL records to CSV for easier downstream analysis.
         step_csv = self.run_dir / "metrics_step.csv"
         epoch_csv = self.run_dir / "metrics_epoch.csv"
         try:
@@ -392,6 +533,16 @@ class MetricLogger:
 
 # ============================== Lightning Module ============================== #
 class EEGLitModule(pl.LightningModule):
+    """
+    Lightning module wrapping:
+    - encoder backbone (UltimateMEGEncoder)
+    - CLIP-style in-batch retrieval loss
+    - periodic metric logging (TopK/MRR)
+
+    Forward contract
+    ----------------
+    forward(batch) returns meg features of shape [B, 1024, T].
+    """
     def __init__(self, model_cfg: dict, lr: float = 3e-4, weight_decay: float = 0.0,
                  warmup_ratio: float = 0.1, max_epochs: int = 100, optimizer_name: str = "adamw",
                  metric_logger: MetricLogger | None = None,
@@ -399,14 +550,16 @@ class EEGLitModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters(ignore=["metric_logger"])
 
+        # Inspect the encoder signature so we can safely pass config keys.
         enc_sig = inspect.signature(UltimateMEGEncoder).parameters
         enc_cfg = dict(model_cfg)
         if "out_timesteps" in enc_sig and enc_cfg.get("out_timesteps") is None:
             pass
 
-        # 使用 MEG-style UltimateMEGEncoder
+        # Instantiate the MEG-style encoder backbone for EEG windows.
         self.model = UltimateMEGEncoder(**enc_cfg)
 
+        # Loss matches the evaluation design: fixed T=360 and fixed temperature by default.
         self.loss_fn = PaperClipLoss(target_T=TARGET_T, pool=False, center=False,
                                      trim_min=None, trim_max=None, use_temperature=bool(loss_use_temp))
         self.lr = lr
@@ -417,6 +570,7 @@ class EEGLitModule(pl.LightningModule):
         self.metric_logger = metric_logger
         self.metrics_every_n_steps = max(1, int(metrics_every_n_steps))
 
+        # Epoch accumulators for clean per-epoch summaries.
         self._train_epoch_losses: List[float] = []
         self._val_epoch_losses: List[float] = []
         self._best_val: float | None = None
@@ -424,13 +578,15 @@ class EEGLitModule(pl.LightningModule):
         self._val_metric_sums: Dict[str, float] = defaultdict(float);   self._val_metric_count: int = 0
 
     def forward(self, batch):
-        # 仅使用 local 分支：返回 [B, out_channels, T]
+        # Local-only branch: returns [B, out_channels=1024, T]
         return self.model(meg_win=batch["meg_win"], sensor_locs=batch["sensor_locs"], subj_idx=batch["subject_idx"])
 
     def _assert_T(self, y: torch.Tensor):
+        # Hard assertion to catch architecture mismatches early.
         assert y.dim() == 3 and y.size(1) == 1024, f"Encoder must output [B,1024,T], got {tuple(y.shape)}"
 
     def _acc(self, store: Dict[str, float], metrics: Dict[str, float], which: str):
+        # Accumulate metrics for epoch-level averaging.
         for k, v in metrics.items(): store[k] += float(v)
         if which == "train": self._train_metric_count += 1
         else: self._val_metric_count += 1
@@ -448,6 +604,7 @@ class EEGLitModule(pl.LightningModule):
         metrics = batch_retrieval_metrics(logits.detach(), ks=(1,5,10))
         self._acc(self._train_metric_sums, metrics, "train")
         
+        # Step-level logging (rank 0 only to avoid duplicated files on DDP).
         if self.trainer.is_global_zero and self.metric_logger is not None:
             if (int(self.global_step) % self.metrics_every_n_steps) == 0:
                 lr = None
@@ -475,6 +632,7 @@ class EEGLitModule(pl.LightningModule):
         metrics = batch_retrieval_metrics(logits.detach(), ks=(1,5,10))
         self._acc(self._val_metric_sums, metrics, "val")
         
+        # Validation step logging (rank 0 only).
         if self.trainer.is_global_zero and self.metric_logger is not None:
             if (batch_idx % self.metrics_every_n_steps) == 0:
                 self.metric_logger.write_step(
@@ -493,6 +651,7 @@ class EEGLitModule(pl.LightningModule):
         loss, logits = self.loss_fn(meg_feat, batch["audio"])
         metrics = batch_retrieval_metrics(logits.detach(), ks=(1,5,10))
         
+        # Test step logging (rank 0 only).
         if self.trainer.is_global_zero and self.metric_logger is not None:
             self.metric_logger.write_step(
                 "test_step", int(self.global_step), int(self.current_epoch),
@@ -507,6 +666,7 @@ class EEGLitModule(pl.LightningModule):
     def _fmt4(x: float | None) -> str: return "n/a" if x is None else f"{x:.4f}"
 
     def on_validation_epoch_end(self):
+        # Epoch summary: losses + averaged retrieval metrics.
         tr = np.mean(self._train_epoch_losses).item() if self._train_epoch_losses else None
         va = np.mean(self._val_epoch_losses).item() if self._val_epoch_losses else None
         
@@ -541,17 +701,20 @@ class EEGLitModule(pl.LightningModule):
                 f"MeanRank={self._fmt4(mget(vam,'mean_rank'))}"
             )
         
+        # Reset epoch accumulators.
         self._train_epoch_losses.clear()
         self._val_epoch_losses.clear()
         self._train_metric_sums.clear(); self._train_metric_count = 0
         self._val_metric_sums.clear();   self._val_metric_count = 0
 
     def configure_optimizers(self):
+        # Optimizer selection (Adam vs AdamW).
         if self.optimizer_name.lower() == "adam":
             optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
         else:
             optimizer = torch.optim.AdamW(self.parameters(), lr=self.lr, weight_decay=self.weight_decay)
 
+        # Cosine decay with linear warmup (step-based schedule).
         def lr_lambda(step: int):
             max_steps = max(1, self.trainer.estimated_stepping_batches)
             warmup = int(self.warmup_ratio * max_steps)
@@ -566,6 +729,9 @@ class EEGLitModule(pl.LightningModule):
 
 # ============================== Utils & Main ============================== #
 def map_amp_to_precision(amp: str) -> str | int:
+    """
+    Map user-facing AMP flag to Lightning precision argument.
+    """
     amp = amp.lower()
     if amp in ("off","none","32","fp32"): return 32
     elif amp in ("fp16","16","16-mixed","half"): return "16-mixed"
@@ -573,6 +739,9 @@ def map_amp_to_precision(amp: str) -> str | int:
     else: raise ValueError(f"Unsupported --amp: {amp}")
 
 def build_run_dir(experiment_name: str, default_root: str = "runs") -> Path:
+    """
+    Create a unique run directory under default_root, optionally including SLURM job ID.
+    """
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     jobid = os.environ.get("SLURM_JOB_ID")
     suffix = f"{experiment_name}_{ts}" + (f"_job{jobid}" if jobid else "")
@@ -584,6 +753,13 @@ def build_run_dir(experiment_name: str, default_root: str = "runs") -> Path:
 def save_records(run_dir: Path, cfg: dict, best_ckpt_path: str | None,
                  subject_map_path: Optional[str] = None,
                  registry: Optional[SubjectRegistry] = None):
+    """
+    Persist run metadata needed for exact reproduction:
+    - full CLI args snapshot (cfg["args"])
+    - model_cfg
+    - subject mapping path + snapshot
+    - best checkpoint pointer
+    """
     rec_dir = run_dir / "records"; rec_dir.mkdir(parents=True, exist_ok=True)
     with open(rec_dir / "config.json", "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2, ensure_ascii=False)
@@ -634,7 +810,7 @@ def parse_args():
     p.add_argument("--n_subjects", type=int, default=None)
     p.add_argument("--out_channels", type=int, default=1024)
     
-    # MEG-style Encoder 参数（与 MEG train.train 对齐）
+    # MEG-style encoder hyperparameters (kept aligned with MEG training scripts)
     p.add_argument("--spatial_channels", type=int, default=270)
     p.add_argument("--fourier_k", type=int, default=32)
     p.add_argument("--d_model", type=int, default=320)
@@ -649,7 +825,7 @@ def parse_args():
     p.add_argument("--spatial_dropout_p", type=float, default=0.0)
     p.add_argument("--spatial_dropout_radius", type=float, default=0.2)
 
-    # 其他杂项
+    # Misc.
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--default_root_dir", type=str, default="runs")
     p.add_argument("--experiment_name", type=str, default="eeg_exp")
@@ -677,7 +853,7 @@ def main():
     metric_logger = MetricLogger(run_dir)
     records_dir = run_dir / "records"; records_dir.mkdir(parents=True, exist_ok=True)
 
-    # SubjectRegistry
+    # SubjectRegistry: load existing mapping if provided; otherwise build from manifests.
     train_p, val_p, test_p = Path(args.train_manifest), Path(args.val_manifest), Path(args.test_manifest)
     ns_tr, ns_va, ns_te = args.subject_namespace_train, args.subject_namespace_val, args.subject_namespace_test
     map_path = Path(args.subject_mapping_path) if args.subject_mapping_path else (run_dir / "records" / "subject_mapping.json")
@@ -695,7 +871,8 @@ def main():
                        batch_size=args.batch_size, num_workers=args.num_workers, normalize=args.normalize)
     dm.setup(None)
 
-    # 自动 override in_channels
+    # Auto-detect the number of EEG channels from the first sample and override in_channels.
+    # This avoids silent mismatch if manifests contain different channel counts.
     sample = dm.train_set[0] if len(dm.train_set) > 0 else dm.val_set[0]
     auto_C = int(sample["meg_win"].shape[0])
 
@@ -706,9 +883,10 @@ def main():
         )
         args.in_channels = auto_C
 
+    # Determine number of subjects used by the encoder subject embedding table.
     n_subjects = args.n_subjects if args.n_subjects is not None else max(1, registry.num_subjects)
 
-    # 配置给 MEG-style UltimateMEGEncoder（只用 local 分支，context_mode='none'）
+    # Encoder config (local-only; context disabled via context_mode="none").
     model_cfg = dict(
         in_channels=args.in_channels,
         n_subjects=n_subjects,
@@ -742,6 +920,7 @@ def main():
         token_pool_max_T=0,
     )
 
+    # Scale LR by effective batch size (batch_size × grad_accum × num_devices).
     effective_bsz = args.batch_size * args.accumulate_grad_batches * devices
     scaled_lr = args.lr * (effective_bsz / max(1, args.base_bsz_for_lr))
     logger.info(f"train: {len(dm.train_set):,} | valid: {len(dm.val_set):,} | test: {len(dm.test_set):,}")
@@ -761,6 +940,7 @@ def main():
         metrics_every_n_steps=args.metrics_every_n_steps,
     )
 
+    # Save full run configuration snapshot for exact reproduction.
     cfg_to_save = {
         "args": vars(args),
         "model_cfg": model_cfg,
@@ -773,6 +953,9 @@ def main():
     save_records(run_dir, cfg_to_save, best_ckpt_path=None,
                  subject_map_path=str(map_path), registry=registry)
 
+    # Checkpointing:
+    # - save_last=True: always keep last.ckpt
+    # - save_top_k=-1: keep all checkpoints (useful for retrospective selection)
     ckpt_cb = ModelCheckpoint(
         dirpath=run_dir / "checkpoints",
         filename="eeg-{epoch:03d}-{val_loss:.4f}",
@@ -799,9 +982,11 @@ def main():
     try:
         trainer.fit(lit, datamodule=dm)
     finally:
+        # Always export CSV even if training is interrupted.
         if metric_logger:
             metric_logger.export_tables()
 
+    # Record best checkpoint path for evaluation scripts.
     best_path = ckpt_cb.best_model_path
     if not best_path:
         last = (run_dir / "checkpoints" / "last.ckpt")
@@ -809,6 +994,7 @@ def main():
     save_records(run_dir, cfg_to_save, best_ckpt_path=best_path,
                  subject_map_path=str(map_path), registry=registry)
 
+    # Final test using the best checkpoint selected by val/loss.
     trainer.test(lit, datamodule=dm, ckpt_path="best")
     if metric_logger:
         metric_logger.export_tables()
