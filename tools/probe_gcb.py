@@ -39,6 +39,19 @@ TARGET_T = 360     # temporal alignment
 AUDIO_D = 1024
 EPS = 1e-8
 
+def get_meg_encoder_class(name: str):
+    
+    name = name.lower()
+    if name == "dense":
+        from models.meg_encoder_Dense import UltimateMEGEncoder
+        return UltimateMEGEncoder
+    elif name == "exp":
+        from models.meg_encoder_ExpDilated import UltimateMEGEncoder
+        return UltimateMEGEncoder
+    else:
+        raise ValueError(f"Unknown meg_encoder: {name}")
+
+
 # ------------------------- I/O & utilities -------------------------
 def log(msg: str):
     print(msg, flush=True)
@@ -185,8 +198,6 @@ def choose_ckpt_path(args) -> Path:
     assert ckpt_path.exists(), f"--ckpt_path not found: {ckpt_path}"
     return ckpt_path
 
-from models.meg_encoder_Dense import UltimateMEGEncoder  # depends on your project layout
-
 def _read_logit_scale_exp(ckpt_path: Path) -> Optional[float]:
     sd = torch.load(ckpt_path, map_location="cpu")
     state = sd.get("state_dict", sd)
@@ -202,7 +213,15 @@ def _read_logit_scale_exp(ckpt_path: Path) -> Optional[float]:
                     pass
     return None
 
-def load_model_from_ckpt(ckpt_path: Path, run_dir: Path, device: str) -> Tuple[UltimateMEGEncoder, Dict[str,Any]]:
+def load_model_from_ckpt(
+    ckpt_path: Path,
+    run_dir: Path,
+    device: str,
+    meg_encoder: str,
+) -> Tuple[torch.nn.Module, Dict[str, Any]]:
+    """
+    Construct UltimateMEGEncoder (selected by --meg_encoder) and load weights.
+    """
     model_cfg = load_cfg_from_records(run_dir)
     ckpt = torch.load(ckpt_path, map_location="cpu")
     if not model_cfg:
@@ -210,12 +229,16 @@ def load_model_from_ckpt(ckpt_path: Path, run_dir: Path, device: str) -> Tuple[U
         model_cfg = hp.get("model_cfg", {}) or hp.get("enc_cfg", {})
     assert model_cfg, "找不到 model_cfg/enc_cfg（records/config.json 或 ckpt.hyper_parameters）"
 
-    if "out_timesteps" in UltimateMEGEncoder.__init__.__code__.co_varnames:
+    EncoderCls = get_meg_encoder_class(meg_encoder)
+
+    if "out_timesteps" in EncoderCls.__init__.__code__.co_varnames:
         model_cfg["out_timesteps"] = None  # disable temporal pooling for evaluation/probing
 
-    model = UltimateMEGEncoder(**model_cfg)
+    log(f"[INFO] meg_encoder = {meg_encoder}")
+
+    model = EncoderCls(**model_cfg)
     state = ckpt.get("state_dict", ckpt)
-    new_state = { (k[6:] if k.startswith("model.") else k): v for k, v in state.items() }
+    new_state = {(k[6:] if k.startswith("model.") else k): v for k, v in state.items()}
     missing, unexpected = model.load_state_dict(new_state, strict=False)
     if missing:
         log(f"[WARN] Missing keys: {len(missing)}（示例）{missing[:10]}")
@@ -609,7 +632,10 @@ def main(args):
     subj_map = read_subject_mapping_from_records(run_dir)
     log(f"[SUBJECT] loaded from records: {len(subj_map)} subjects")
     ckpt_path = choose_ckpt_path(args)
-    model, meta = load_model_from_ckpt(ckpt_path, run_dir, device=device)
+
+    model, meta = load_model_from_ckpt(
+        ckpt_path, run_dir, device=device, meg_encoder=args.meg_encoder
+    )
     scale = meta.get("logit_scale_exp", None) if args.use_ckpt_logit_scale else None
 
     # Output paths
@@ -845,6 +871,12 @@ def parse_args():
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--amp", type=str, default="bf16", choices=["off", "bf16", "fp16", "16-mixed"])
     p.add_argument("--out_dir", type=str, default="")
+    p.add_argument(
+        "--meg_encoder",
+        default="dense",
+        choices=["dense", "exp"],
+        help="MEG encoder backbone: dense or exp"
+    )
 
     # ---------- Score scaling ----------
     p.add_argument("--use_ckpt_logit_scale", action="store_true")

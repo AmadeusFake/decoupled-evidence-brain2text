@@ -12,16 +12,26 @@ Key features
 - Reuses the standard best-checkpoint resolution logic
 - Given a test manifest, automatically loads sensor_coordinates_path
   from the first entry
+- --meg_encoder flag to select encoder backbone ("dense" or "exp"),
+  following the same import/factory pattern as retrieval_gcb_decode.py.
 
-Example usage (DenseCNN run)
-----------------------------
+Example usage
+-------------
+(DenseCNN run)
     python -m tools.plot_spatial_topomap \
         --run_dir /path/to/run_dir \
         --use_best_ckpt \
         --test_manifest /path/to/test_manifest.jsonl \
+        --meg_encoder dense \
         --output figs/topomap_densecnn.png
 
-For ExpCNN runs, only change --run_dir and --output.
+(ExpDilated run)
+    python -m tools.plot_spatial_topomap \
+        --run_dir /path/to/run_dir \
+        --use_best_ckpt \
+        --test_manifest /path/to/test_manifest.jsonl \
+        --meg_encoder exp \
+        --output figs/topomap_expdilated.png
 """
 
 import argparse
@@ -34,14 +44,39 @@ import torch
 import matplotlib.pyplot as plt
 import mne
 
-# ======= Utility functions (aligned with retrieval_window_vote.py) ======= #
+def get_meg_encoder_class(name: str):
+    """
+    Factory for selecting MEG encoder backbone.
 
+    Parameters
+    ----------
+    name : {"dense", "exp"}
+        Encoder variant.
+
+    Returns
+    -------
+    Encoder class (not instance).
+    """
+    name = name.lower()
+    if name == "dense":
+        from models.meg_encoder_Dense import UltimateMEGEncoder
+        return UltimateMEGEncoder
+    elif name == "exp":
+        from models.meg_encoder_ExpDilated import UltimateMEGEncoder
+        return UltimateMEGEncoder
+    else:
+        raise ValueError(f"Unknown meg_encoder: {name}")
+
+
+# ======= Utility functions (aligned with retrieval_window_vote.py) ======= #
 def log(msg: str):
     print(msg, flush=True)
+
 
 def read_jsonl(p: Path):
     with open(p, "r", encoding="utf-8") as f:
         return [json.loads(l) for l in f if l.strip()]
+
 
 def load_cfg_from_records(run_dir: Path) -> Dict[str, Any]:
     """
@@ -55,6 +90,7 @@ def load_cfg_from_records(run_dir: Path) -> Dict[str, Any]:
         cfg = json.loads(rec.read_text(encoding="utf-8"))
         return cfg.get("model_cfg", {}) or cfg.get("enc_cfg", {}) or {}
     return {}
+
 
 def choose_ckpt_path(run_dir: Path, ckpt_path: str, use_best_ckpt: bool) -> Path:
     """
@@ -76,7 +112,6 @@ def choose_ckpt_path(run_dir: Path, ckpt_path: str, use_best_ckpt: bool) -> Path
     assert cp.exists(), f"--ckpt_path not found: {cp}"
     return cp
 
-from models.meg_encoder_ExpDilated import UltimateMEGEncoder  # keep consistent with eval
 
 def _read_logit_scale_exp(ckpt_path: Path) -> Optional[float]:
     """
@@ -99,9 +134,16 @@ def _read_logit_scale_exp(ckpt_path: Path) -> Optional[float]:
                     pass
     return None
 
-def load_model_from_ckpt(ckpt_path: Path, run_dir: Path, device: str):
+
+def load_model_from_ckpt(
+    ckpt_path: Path,
+    run_dir: Path,
+    device: str,
+    meg_encoder: str,
+):
     """
-    Construct UltimateMEGEncoder and load weights from checkpoint.
+    Construct UltimateMEGEncoder (selected by --meg_encoder) and load weights
+    from checkpoint.
 
     Implementation follows retrieval_window_vote.py to ensure that
     the exact same model definition is used for visualization.
@@ -113,13 +155,16 @@ def load_model_from_ckpt(ckpt_path: Path, run_dir: Path, device: str):
         model_cfg = hp.get("model_cfg", {}) or hp.get("enc_cfg", {})
     assert model_cfg, "no model_cfg/enc_cfg found in records or ckpt.hyper_parameters"
 
+    EncoderCls = get_meg_encoder_class(meg_encoder)
+
     # Disable temporal pooling for evaluation-style usage
-    if "out_timesteps" in UltimateMEGEncoder.__init__.__code__.co_varnames:
+    if "out_timesteps" in EncoderCls.__init__.__code__.co_varnames:
         model_cfg["out_timesteps"] = None
 
+    log(f"[INFO] meg_encoder = {meg_encoder}")
     log(f"[INFO] Model config keys: {list(model_cfg.keys())}")
 
-    model = UltimateMEGEncoder(**model_cfg)
+    model = EncoderCls(**model_cfg)
     state = ckpt.get("state_dict", ckpt)
 
     # Strip 'model.' prefix if present
@@ -134,8 +179,8 @@ def load_model_from_ckpt(ckpt_path: Path, run_dir: Path, device: str):
     meta = {"logit_scale_exp": _read_logit_scale_exp(ckpt_path)}
     return model, meta
 
-# ======= Compute SpatialAttention channel weights ======= #
 
+# ======= Compute SpatialAttention channel weights ======= #
 def compute_sensor_weights_from_spatial(spatial_module, sensor_coords: np.ndarray) -> np.ndarray:
     """
     Compute average SpatialAttention weights for each real sensor.
@@ -162,25 +207,17 @@ def compute_sensor_weights_from_spatial(spatial_module, sensor_coords: np.ndarra
     coords_t = torch.from_numpy(coords).unsqueeze(0).to(device)  # [1, C, 2/3]
 
     with torch.no_grad():
-        # Internal SpatialAttention logic:
-        # xy = sensor_locs[..., :2]
-        # pos_feat = self.fourier(xy)
-        # q = self.query(pos_feat)  # [B, C, S]
         xy = coords_t[..., :2]
         pos_feat = spatial_module.fourier(xy)       # [1, C, pos_dim]
         q = spatial_module.query(pos_feat)          # [1, C, S]
-
-        # No dropout in eval mode; mask is not needed
         attn = torch.softmax(q, dim=1)[0]           # [C, S]
         attn = torch.nan_to_num(attn)
-
-        # Average over virtual channel dimension
         sensor_w = attn.mean(dim=1).cpu().numpy()   # [C]
 
     return sensor_w
 
-# ======= Plot topomap with MNE ======= #
 
+# ======= Plot topomap with MNE ======= #
 def plot_topomap_from_weights(
     sensor_w: np.ndarray,
     sensor_coords: np.ndarray,
@@ -250,16 +287,18 @@ def plot_topomap_from_weights(
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(output_path, dpi=300)
-    plt.close(fig)
 
-    # Also save a PDF version for LaTeX / paper use
+    # Save PNG + PDF (save before close)
+    fig.savefig(output_path, dpi=300, bbox_inches="tight")
     pdf_path = output_path.with_suffix(".pdf")
-    fig.savefig(pdf_path, bbox_inches="tight")
+    fig.savefig(pdf_path, dpi=300, bbox_inches="tight")
+
+    plt.close(fig)
     print(f"[INFO] Saved topomap to: {output_path}")
+    print(f"[INFO] Saved topomap to: {pdf_path}")
+
 
 # ======= CLI entry point ======= #
-
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--run_dir", type=str, required=True,
@@ -278,7 +317,14 @@ def parse_args():
                    help="Output image path (relative to run_dir)")
     p.add_argument("--title", type=str, default="SpatialAttention sensor weights",
                    help="Title shown on the topomap")
+    p.add_argument(
+        "--meg_encoder",
+        default="exp",                    # keep old behavior of this script
+        choices=["dense", "exp"],
+        help="MEG encoder backbone: dense (UltimateMEGEncoder) or exp (ExpDilated)"
+    )
     return p.parse_args()
+
 
 def main():
     args = parse_args()
@@ -290,8 +336,13 @@ def main():
     )
     ckpt_path = choose_ckpt_path(run_dir, args.ckpt_path, args.use_best_ckpt)
 
-    # 1) Load model (UltimateMEGEncoder)
-    model, meta = load_model_from_ckpt(ckpt_path, run_dir, device=device)
+    # 1) Load model (UltimateMEGEncoder selected by --meg_encoder)
+    model, meta = load_model_from_ckpt(
+        ckpt_path,
+        run_dir,
+        device=device,
+        meg_encoder=args.meg_encoder,
+    )
     log(f"[INFO] Loaded model from {ckpt_path}")
     if meta.get("logit_scale_exp") is not None:
         log(f"[INFO] exp(logit_scale) = {meta['logit_scale_exp']:.6f}")
@@ -330,6 +381,7 @@ def main():
         title=args.title,
         output_path=out_path,
     )
+
 
 if __name__ == "__main__":
     torch.set_float32_matmul_precision("high")
