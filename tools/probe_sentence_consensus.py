@@ -6,7 +6,7 @@ from collections import defaultdict
 import torch
 import torch.nn.functional as F
 
-# ==== 从你的评测脚本移植的句别名工具 ====
+# ==== Sentence-alias utilities ported from your evaluation script ====
 _CAND_SENT_KEYS = ["sentence_id","sentence_uid","utt_id","utterance_id","segment_id",
                    "original_sentence_id","sentence_path","sentence_audio_path","transcript_path"]
 
@@ -53,7 +53,7 @@ def lookup_sent_idx(row, alias2idx):
         if a in alias2idx: return alias2idx[a]
     return None
 
-# ==== 聚合器 ====
+# ==== Aggregators ====
 def sent_len_norm(n, mode="sqrt"):
     if n<=0 or mode=="none": return 1.0
     if mode=="count": return 1.0/float(n)
@@ -73,7 +73,7 @@ def aggregate(vals: torch.Tensor, agg: str, top_m: int):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--test_manifest", required=True)
-    ap.add_argument("--preds_jsonl",  required=True)  # 来自 baseline（无任何vote/gcb/qccp）
+    ap.add_argument("--preds_jsonl",  required=True)  # from baseline (no vote/gcb/qccp)
     ap.add_argument("--q", type=float, default=0.8)
     ap.add_argument("--agg", type=str, default="mean", choices=["mean","max","logsumexp"])
     ap.add_argument("--top_m", type=int, default=3)
@@ -82,7 +82,7 @@ def main():
     ap.add_argument("--out", type=str, default="")
     args = ap.parse_args()
 
-    # 读 test rows，并构造候选池（唯一窗口 + 代表行）
+    # Read test rows and construct candidate pool (unique windows + representative rows)
     rows = [json.loads(l) for l in open(args.test_manifest, "r", encoding="utf-8") if l.strip()]
     uniq, rep_rows = {}, []
     for r in rows:
@@ -102,8 +102,8 @@ def main():
         sidx = lookup_sent_idx(r, alias2idx)
         qidx2s.append(sidx if sidx is not None else -1)
 
-    # 读取 baseline 的 topK 窗口与分数
-    # 每条记录: {"query_index": int, "gt_rank":..., "gt_cid":..., "pred_cids":[...], "pred_scores":[...]}
+    # Read baseline topK windows and scores
+    # Each record: {"query_index": int, "gt_rank":..., "gt_cid":..., "pred_cids":[...], "pred_scores":[...]}
     ok, tot = 0, 0
     gt_win_rate, margins, betas = [], [], []
     miss_map = 0
@@ -112,7 +112,7 @@ def main():
         rec = json.loads(line)
         q = int(rec["query_index"])
         gt_s = qidx2s[q]
-        if gt_s is None or gt_s < 0: 
+        if gt_s is None or gt_s < 0:
             miss_map += 1
             continue
 
@@ -124,12 +124,12 @@ def main():
         cids = [c for c,k in zip(cids, keep.tolist()) if k]
         vals = scores[keep]
 
-        # 聚合到句子
+        # Aggregate to sentence level
         sent2vals = defaultdict(list)
         for c, v in zip(cids, vals):
             s = cid2s.get(c, -1)
             if s >= 0: sent2vals[s].append(v)
-        if not sent2vals: 
+        if not sent2vals:
             continue
 
         sent_ids, supports, sizes = [], [], []
@@ -141,25 +141,25 @@ def main():
         sent_ids = torch.tensor(sent_ids, dtype=torch.long)
         supports = torch.stack(supports)
 
-        # Top-S 句与 β（熵门控）
+        # Top-S sentences and beta (entropy gating)
         kS = min(args.topS, supports.numel())
         topS_val, topS_idx = torch.topk(supports, k=kS, largest=True, sorted=True)
         p = F.softmax(topS_val, dim=0)
         ent = -(p * (p + 1e-8).log()).sum() / np.log(float(max(1,kS)))
-        beta = float(1.0 - ent)  # 与你代码相同的归一化
+        beta = float(1.0 - ent)  # same normalized form as your main code
         betas.append(beta)
 
         topS_sent = sent_ids[topS_idx]
         is_hit = (gt_s in topS_sent.tolist())
         ok += int(is_hit); tot += 1
 
-        # GT vs. 最强错句 margin
+        # Margin: GT sentence support vs best wrong sentence support
         gt_mask = (sent_ids == gt_s)
         sup_gt = supports[gt_mask].max().item() if gt_mask.any() else -1e9
         sup_wrong = supports[~gt_mask].max().item() if (~gt_mask).any() else -1e9
         margins.append(sup_gt - sup_wrong)
 
-        # 记录 GT 窗口是否在被选句内的 Top-1（可选：此处略）
+        # Record whether the GT window is within the selected sentence's top-1 (optional; omitted here)
 
     hit_ratio = ok / max(1, tot)
     print(f"[PROBE] Queries probed = {tot},  GT-in-TopS ratio = {hit_ratio:.4f},  "

@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-tools/probe_gcb.py  —  Standalone GCB Probe (no changes to your eval code)
+tools/probe_gcb.py — Standalone GCB Probe (no changes to your eval code)
 
-功能：
-- 读取 test.jsonl 与 run_dir（从 ckpt / records 恢复模型配置）
-- 构建“唯一候选窗口池”（audio features）
-- 以“句子组”为单位：编码 MEG → 计算 base logits → 做一次 GCB 支持度快照
-- 额外诊断：hubness（非GT被选为top1的组计数）、支持分布偏斜度（Gini/HHI）、句长偏置相关性、
-  per-query 上限 r=1 对照（one-vote-per-query）下的 gt_in_topS 变化
-- 可选：模拟施加 GCB（不写回模型，只在脚本内计算），对比 rank 改善/伤害/不变
-- 输出：
-  - <out_dir>/gcb_probe.jsonl          逐组记录
-  - <out_dir>/gcb_probe_summary.json   总体统计
-  - <out_dir>/hubness_top.json         非GT top1 频次最高的句子（前K）
+What it does
+------------
+- Load test.jsonl and run_dir (recover model config from ckpt / records)
+- Build a UNIQUE candidate window pool (audio features)
+- Operate at the sentence-group level:
+    encode MEG → compute base logits → take a single GCB support snapshot
+- Extra diagnostics:
+    hubness (non-GT sentences selected as top-1), support skewness (Gini/HHI),
+    sentence-length bias correlation, and a per-query r=1 control
+    (one-vote-per-query) for gt_in_topS changes
+- Optional:
+    simulate applying GCB (does not modify the model; computed in-script only),
+    and compare rank improved / harmed / unchanged
+- Outputs:
+  - <out_dir>/gcb_probe.jsonl          per-group records
+  - <out_dir>/gcb_probe_summary.json   aggregated statistics
+  - <out_dir>/hubness_top.json         top-K most frequent non-GT top1 sentences
 """
 
 import argparse
@@ -28,12 +34,12 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
-# ------------------------- 常量 -------------------------
-TARGET_T = 360     # 时间对齐
+# ------------------------- Constants -------------------------
+TARGET_T = 360     # temporal alignment
 AUDIO_D = 1024
 EPS = 1e-8
 
-# ------------------------- I/O & 工具 -------------------------
+# ------------------------- I/O & utilities -------------------------
 def log(msg: str):
     print(msg, flush=True)
 
@@ -68,7 +74,7 @@ def maybe_interp_1DT(x: torch.Tensor, T: int) -> torch.Tensor:
         return x
     return F.interpolate(x.unsqueeze(0), size=T, mode="linear", align_corners=False).squeeze(0)
 
-# ------------------------- 句子别名 -------------------------
+# ------------------------- Sentence aliases -------------------------
 _CAND_SENT_KEYS = [
     "sentence_id", "sentence_uid",
     "utt_id", "utterance_id", "segment_id",
@@ -107,7 +113,7 @@ def build_sentence_index_with_alias(candidate_rows: list):
     canon2idx = {}
     alias2idx = {}
     cand_sent_idx = []
-    sid2name = {}  # 追加：可读名
+    sid2name = {}  # human-readable name
 
     for r in candidate_rows:
         aliases = sentence_aliases(r)
@@ -131,7 +137,7 @@ def sent_key_for_group(r: dict) -> Tuple[str, str]:
     als = sentence_aliases(r)
     return als[0] if als else ("unknown", content_id_of(r))
 
-# ------------------------- subject 映射 -------------------------
+# ------------------------- Subject mapping -------------------------
 def _normalize_subject_key(x: Any) -> Optional[str]:
     if x is None:
         return None
@@ -155,7 +161,7 @@ def read_subject_mapping_from_records(run_dir: Path) -> Dict[str, int]:
     assert out, "[SUBJECT] empty mapping after normalization"
     return out
 
-# ------------------------- 模型加载 -------------------------
+# ------------------------- Model loading -------------------------
 def load_cfg_from_records(run_dir: Path) -> Dict[str, Any]:
     rec = run_dir / "records" / "config.json"
     if rec.exists():
@@ -179,7 +185,7 @@ def choose_ckpt_path(args) -> Path:
     assert ckpt_path.exists(), f"--ckpt_path not found: {ckpt_path}"
     return ckpt_path
 
-from models.meg_encoder_Dense import UltimateMEGEncoder  # 依赖你的工程位置
+from models.meg_encoder_Dense import UltimateMEGEncoder  # depends on your project layout
 
 def _read_logit_scale_exp(ckpt_path: Path) -> Optional[float]:
     sd = torch.load(ckpt_path, map_location="cpu")
@@ -205,7 +211,7 @@ def load_model_from_ckpt(ckpt_path: Path, run_dir: Path, device: str) -> Tuple[U
     assert model_cfg, "找不到 model_cfg/enc_cfg（records/config.json 或 ckpt.hyper_parameters）"
 
     if "out_timesteps" in UltimateMEGEncoder.__init__.__code__.co_varnames:
-        model_cfg["out_timesteps"] = None  # 评测端不做时间池化
+        model_cfg["out_timesteps"] = None  # disable temporal pooling for evaluation/probing
 
     model = UltimateMEGEncoder(**model_cfg)
     state = ckpt.get("state_dict", ckpt)
@@ -254,7 +260,7 @@ def encode_meg_batch(model, batch_rows: List[dict], device: str, subj_map: Dict[
         y = F.interpolate(y, size=TARGET_T, mode="linear", align_corners=False)
     return y  # [B,1024,360]
 
-# ------------------------- 候选池 -------------------------
+# ------------------------- Candidate pool -------------------------
 @torch.no_grad()
 def load_audio_pool_unique(test_rows: List[dict], device: str, dtype: torch.dtype):
     uniq: Dict[str, int] = {}
@@ -281,7 +287,7 @@ def load_audio_pool_unique(test_rows: List[dict], device: str, dtype: torch.dtyp
     A = torch.stack(feats, 0).to(device=device, dtype=dtype)  # [O,1024,360]
     return A, ids, rep_rows
 
-# ------------------------- 相似度（clip-style） -------------------------
+# ------------------------- Similarity (clip-style) -------------------------
 def compute_logits_clip(queries: torch.Tensor, pool: torch.Tensor,
                         scale: Optional[float] = None) -> torch.Tensor:
     q = queries.to(torch.float32)
@@ -292,7 +298,7 @@ def compute_logits_clip(queries: torch.Tensor, pool: torch.Tensor,
         logits = logits * float(scale)
     return logits.to(torch.float32)
 
-# ------------------------- 句桶 + 统计工具 -------------------------
+# ------------------------- Sentence buckets + stats helpers -------------------------
 def _precompute_sentence_buckets(cand_sent_idx_o: torch.Tensor) -> Dict[int, torch.Tensor]:
     buckets = {}
     uniq = torch.unique(cand_sent_idx_o)
@@ -330,7 +336,7 @@ def pearson_corr(x: List[float], y: List[float]) -> Optional[float]:
         return 0.0
     return float(np.corrcoef(a, b)[0, 1])
 
-# ------------------------- GCB 快照（仅诊断，不改 logits） -------------------------
+# ------------------------- GCB snapshot (diagnostic only; does not modify logits) -------------------------
 @torch.no_grad()
 def gcb_support_snapshot(
     base_logits_bo: torch.Tensor,
@@ -357,7 +363,7 @@ def gcb_support_snapshot(
         "unlabeled_kept": 0,
         "gini": None,
         "hhi": None,
-        "gt_in_topS_cap1": None,  # r=1 per-query 对照
+        "gt_in_topS_cap1": None,  # per-query r=1 control
         "margin_cap1": None,
     }
     if K <= 0 or B == 0 or O == 0:
@@ -380,7 +386,7 @@ def gcb_support_snapshot(
     S_sel = us.numel()
     snap["num_sents_kept"] = int(S_sel)
 
-    # 句级支持度
+    # Sentence-level support
     if agg == "mean":
         counts = torch.bincount(inv, minlength=S_sel).clamp_min_(1)
         sums = torch.zeros(S_sel, dtype=vals_all.dtype, device=device)
@@ -399,7 +405,7 @@ def gcb_support_snapshot(
             m0 = torch.max(vk)
             sent_support[k] = m0 + torch.log(torch.clamp(torch.exp(vk - m0).sum(), min=EPS))
 
-    # 句长归一
+    # Sentence-length normalization
     bucket_sizes = [int(buckets.get(int(s.item()), torch.empty(0, device=device)).numel()) for s in us]
     def _norm(n: int) -> float:
         if sent_norm == "none": return 1.0
@@ -410,12 +416,12 @@ def gcb_support_snapshot(
     norms = torch.tensor([_norm(n) for n in bucket_sizes], dtype=sent_support.dtype, device=device)
     sent_support = sent_support * norms  # [S_sel]
 
-    # Gini/HHI（看是否被少数句子劫持）
+    # Gini/HHI (support concentration / hijacking)
     sup_np = sent_support.detach().cpu().numpy()
     snap["gini"] = gini_coefficient(sup_np)
     snap["hhi"] = hhi_index(sup_np)
 
-    # Top-S
+    # Top-S summary
     keepS = min(int(topS), int(sent_support.numel())) if topS > 0 else int(sent_support.numel())
     if keepS > 0 and sent_support.numel() > 0:
         topS_val, topS_idx = torch.topk(sent_support, k=keepS, largest=True, sorted=True)
@@ -428,7 +434,7 @@ def gcb_support_snapshot(
         snap["topS"] = [int(s.item()) for s in us_sel]
         snap["topS_val"] = [float(v.item()) for v in topS_val]
 
-    # 每句统计
+    # Per-sentence records
     for i, sid in enumerate(us.tolist()):
         snap["per_sent"][int(sid)] = {
             "support": float(sent_support[i].item()),
@@ -436,15 +442,10 @@ def gcb_support_snapshot(
             "kept": int(torch.bincount(inv, minlength=S_sel)[i].item()),
         }
 
-    # 对照：per-query cap r=1 的句级支持（每个查询对同一句只投一票=最大票）
-    # 复用上面的 kept索引 (inv==k -> 属于句k的条目)，再按查询 dim 归并
-    # 构造 (query, sid) 的最大 (s - thr) 作为该查询对该句的票
-    # 先把 kept 的 (query_idx, sid, val) 取出来：
+    # Control: per-query cap r=1 (at most one vote per query per sentence)
     kept_q = torch.nonzero(valid_mask, as_tuple=False)[:, 0]  # [M]
     kept_sid = sids_all
     kept_val = vals_all
-    # 对每个 (q, sid) 取 max：
-    # 建字典累加（避免 GPU 稀疏）：转到 CPU
     q_list = kept_q.detach().cpu().tolist()
     sid_list = kept_sid.detach().cpu().tolist()
     val_list = kept_val.detach().cpu().tolist()
@@ -453,14 +454,11 @@ def gcb_support_snapshot(
         key = (int(q), int(s))
         if key not in qsid2max or v > qsid2max[key]:
             qsid2max[key] = float(v)
-    # 汇总到句级
     cap1_support: Dict[int, float] = {}
     for (q, s), v in qsid2max.items():
         cap1_support[s] = cap1_support.get(s, 0.0) + v
     if cap1_support:
-        # 与 sent_support 同一 sid 空间对齐
         cap1_vec = np.array([cap1_support.get(int(s.item()), 0.0) for s in us], dtype=np.float64)
-        # 同样做 Top-S
         if keepS > 0 and cap1_vec.size > 0:
             topS_idx2 = np.argsort(-cap1_vec)[:keepS]
             topS_val2 = cap1_vec[topS_idx2]
@@ -470,7 +468,7 @@ def gcb_support_snapshot(
             snap["hhi_cap1"] = hhi_index(cap1_vec)
     return snap
 
-# ------------------------- GCB 应用（仅“模拟重排”） -------------------------
+# ------------------------- Apply GCB (simulation only: re-ranking) -------------------------
 @torch.no_grad()
 def gcb_apply_to_group(
     base_logits_bo: torch.Tensor,
@@ -523,7 +521,7 @@ def gcb_apply_to_group(
             m0 = torch.max(vk)
             sent_support[k] = m0 + torch.log(torch.clamp(torch.exp(vk - m0).sum(), min=EPS))
 
-    # 句长归一
+    # Sentence-length normalization
     bucket_sizes = [int(buckets.get(int(s.item()), torch.empty(0, device=device)).numel()) for s in us]
     def _norm(n: int) -> float:
         if sent_norm == "none": return 1.0
@@ -572,7 +570,7 @@ def gcb_apply_to_group(
 
     return base_logits_bo + float(mix_alpha) * boost_o.unsqueeze(0)
 
-# ------------------------- 主流程（探针） -------------------------
+# ------------------------- Main probing loop -------------------------
 def main(args):
     torch.set_float32_matmul_precision("high")
     device = args.device
@@ -582,23 +580,23 @@ def main(args):
     test_rows = read_jsonl(Path(args.test_manifest))
     log(f"[INFO] test rows = {len(test_rows):,}")
 
-    # 候选池
+    # Candidate pool
     A, pool_ids, candidate_rows = load_audio_pool_unique(test_rows, device=device, dtype=torch.float32)
     O = A.size(0)
     log(f"[INFO] candidate windows O={O}")
 
-    # 句 index
+    # Sentence indexing
     canon2idx, alias2idx, cand_sent_idx, sid2name = build_sentence_index_with_alias(candidate_rows)
     S = len(canon2idx)
     log(f"[INFO] sentences S={S}")
     cand_sent_idx = torch.tensor(cand_sent_idx, dtype=torch.long, device=device)
     buckets = _precompute_sentence_buckets(cand_sent_idx)
 
-    # gt → pool index
+    # Map GT → pool index
     cid_to_index = {cid: i for i, cid in enumerate(pool_ids)}
     gt_index = [cid_to_index[content_id_of(r)] for r in test_rows]
 
-    # 组装“句子组”
+    # Build "sentence groups"
     sent2idx: Dict[Tuple[str,str], List[int]] = {}
     for i, r in enumerate(test_rows):
         k = sent_key_for_group(r)
@@ -606,7 +604,7 @@ def main(args):
     groups = list(sent2idx.values())
     log(f"[INFO] Grouping by sentence: groups={len(groups)}, avg windows/sent={len(test_rows)/max(1,len(groups)):.2f}")
 
-    # 模型
+    # Model
     run_dir = Path(args.run_dir)
     subj_map = read_subject_mapping_from_records(run_dir)
     log(f"[SUBJECT] loaded from records: {len(subj_map)} subjects")
@@ -614,12 +612,12 @@ def main(args):
     model, meta = load_model_from_ckpt(ckpt_path, run_dir, device=device)
     scale = meta.get("logit_scale_exp", None) if args.use_ckpt_logit_scale else None
 
-    # 输出
+    # Output paths
     out_dir = Path(args.out_dir) if args.out_dir else (run_dir / "results" / "gcb_probe")
     out_dir.mkdir(parents=True, exist_ok=True)
     f_probe = open(out_dir / "gcb_probe.jsonl", "w", encoding="utf-8")
 
-    # 汇总
+    # Aggregation buffers
     n_queries = len(test_rows)
     gt_in_topS_flags = []
     margins = []
@@ -633,11 +631,11 @@ def main(args):
     imp = harm = same = 0
     simulated = 0
 
-    # 句长偏置相关性（全局）收集
+    # For sentence-length bias correlation (global collection)
     all_len_for_corr: List[float] = []
     all_sup_for_corr: List[float] = []
 
-    # hubness：统计“非GT top1 句”的出现频次
+    # Hubness: count non-GT top1 sentence frequency
     hub_counter: Dict[int, int] = {}
 
     def encode_rows(indices: List[int]) -> torch.Tensor:
@@ -656,14 +654,14 @@ def main(args):
             logits = compute_logits_clip(Y, A, scale=scale)
             logits_pre = logits.clone()
 
-        # 快照
+        # Snapshot
         snap = gcb_support_snapshot(
             logits, cand_sent_idx, buckets,
             topk=args.gcb_topk, q_quantile=args.gcb_q, agg=args.gcb_agg,
             sent_norm=args.gcb_norm, topS=args.gcb_topS
         )
 
-        # 组内 GT 句 id（用组内首个 query 的 gt）
+        # GT sentence id for this group (use the first query's GT)
         g0 = gt_index[q_indices[0]]
         gt_sid = int(cand_sent_idx[g0].item()) if int(cand_sent_idx[g0].item()) >= 0 else None
 
@@ -697,18 +695,18 @@ def main(args):
         if "hhi_cap1" in snap and snap["hhi_cap1"] is not None:
             hhi_cap1_list.append(float(snap["hhi_cap1"]))
 
-        # 供长度偏置相关性：把每句的 (bucket_size, support) 收集
+        # For length-bias correlation: collect (bucket_size, support) pairs
         for sid_str, recs in snap["per_sent"].items():
             all_len_for_corr.append(float(recs["bucket"]))
             all_sup_for_corr.append(float(recs["support"]))
 
-        # hubness：统计“非GT top1”
+        # Hubness: count "non-GT top1"
         if len(snap["topS"]) > 0:
             top1_sid = int(snap["topS"][0])
             if gt_sid is None or top1_sid != gt_sid:
                 hub_counter[top1_sid] = hub_counter.get(top1_sid, 0) + 1
 
-        # 可选：模拟 GCB 重排，看 rank 改变
+        # Optional: simulate GCB re-ranking and measure rank changes
         rank_delta = None
         if args.simulate_rerank:
             simulated += 1
@@ -731,7 +729,7 @@ def main(args):
             imp += improved; harm += harmed; same += same_ct
             rank_delta = {"improved": improved, "harmed": harmed, "same": same_ct}
 
-        # 记录
+        # Record
         rec = {
             "group_first_query": int(q_indices[0]),
             "group_size": len(q_indices),
@@ -764,7 +762,7 @@ def main(args):
 
     f_probe.close()
 
-    # 汇总
+    # Summary
     def safe_stats(arr):
         if not arr:
             return None
@@ -777,7 +775,7 @@ def main(args):
             "p95": float(np.percentile(a, 95)) if a.size >= 20 else None,
         }
 
-    # 长度偏置相关性
+    # Length-bias correlation
     len_sup_corr = pearson_corr(all_len_for_corr, all_sup_for_corr)
 
     summary = {
@@ -810,13 +808,13 @@ def main(args):
                 "harmed_ratio": float(harm / max(1, (imp + harm + same))),
             } if args.simulate_rerank else None
         ),
-        "notes": "hubness_top 保存为单独文件；sid2name 提供可读别名映射。",
+        "notes": "hubness_top is saved separately; sid2name provides readable alias mapping.",
     }
 
     with open(out_dir / "gcb_probe_summary.json", "w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    # 导出 hubness top-K
+    # Export hubness top-K
     topK = max(1, int(args.hubness_topk))
     hub_items = sorted(hub_counter.items(), key=lambda kv: (-kv[1], kv[0]))[:topK]
     hub_json = []
@@ -827,7 +825,7 @@ def main(args):
     with open(out_dir / "hubness_top.json", "w", encoding="utf-8") as f:
         json.dump(hub_json, f, indent=2, ensure_ascii=False)
 
-    # 也保存 sid2name 便于查看
+    # Also save sid2name for easier inspection
     with open(out_dir / "sid2name.json", "w", encoding="utf-8") as f:
         json.dump({int(k): v for k, v in sid2name.items()}, f, indent=2, ensure_ascii=False)
 
@@ -848,10 +846,10 @@ def parse_args():
     p.add_argument("--amp", type=str, default="bf16", choices=["off", "bf16", "fp16", "16-mixed"])
     p.add_argument("--out_dir", type=str, default="")
 
-    # ---------- 评分缩放 ----------
+    # ---------- Score scaling ----------
     p.add_argument("--use_ckpt_logit_scale", action="store_true")
 
-    # ---------- GCB 快照/模拟 参数 ----------
+    # ---------- GCB snapshot / simulation knobs ----------
     p.add_argument("--gcb_topk", type=int, default=512)
     p.add_argument("--gcb_q", type=float, default=0.90)
     p.add_argument("--gcb_agg", type=str, default="logsumexp", choices=["mean", "max", "logsumexp"])
@@ -863,10 +861,10 @@ def parse_args():
     p.add_argument("--gcb_intra_temp", type=float, default=1.5)
     p.add_argument("--gcb_intra_topr", type=int, default=2)
 
-    # ---------- 是否模拟一次 GCB 重排并统计 rank 变化 ----------
+    # ---------- Whether to simulate a GCB re-ranking pass and report rank deltas ----------
     p.add_argument("--simulate_rerank", action="store_true")
 
-    # ---------- 额外导出 ----------
+    # ---------- Extra exports ----------
     p.add_argument("--hubness_topk", type=int, default=50)
 
     return p.parse_args()
@@ -874,6 +872,3 @@ def parse_args():
 if __name__ == "__main__":
     args = parse_args()
     main(args)
-
-
-

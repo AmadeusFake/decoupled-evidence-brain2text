@@ -1,11 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-汇总 sweep 结果（鲁棒版）
-- 自动在 run 根目录 和 records/ 下寻找 epoch 级 JSONL（支持多种文件名）。
-- 逐行扫描 JSONL，自行计算 best_val_mrr / best_val_top1 / best_val_top10（不依赖训练端写 best_*）。
-- 根据 config_init.json 的 monitor（mrr/top1/top10）选择 best_metric 用于排序。
-- 兼容你当前的字段名：val_self_mrr / val_self_top1 / val_self_top10 / train_loss / val_loss。
+Summarize sweep runs (robust)
+
+- Automatically search for an epoch-level JSONL under both the run root and run_dir/records/.
+  Multiple common filenames are supported.
+- Scan the JSONL line-by-line and compute best_val_mrr / best_val_top1 / best_val_top10 ourselves
+  (no dependency on training-time "best_*" being logged).
+- Use the `monitor` field from config_init.json (mrr/top1/top10) to decide `best_metric` for sorting.
+- Compatible with current field names:
+  val_self_mrr / val_self_top1 / val_self_top10 / train_loss / val_loss.
 """
 
 from __future__ import annotations
@@ -13,7 +17,7 @@ import json, csv, argparse, math
 from pathlib import Path
 from typing import Optional, Dict, Any, Iterable, List, Tuple
 
-# 支持的候选文件名（会在 run 根目录 与 records/ 下各找一遍）
+# Candidate filenames to look for (search in run root and run_dir/records/)
 CANDIDATE_JSONL = (
     "epoch_metrics.jsonl",
     "metrics_epoch.jsonl",
@@ -47,18 +51,18 @@ def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
                 continue
 
 def _find_epoch_file(run_dir: Path) -> Optional[Path]:
-    # 先找 run 根目录
+    # 1) search in run root
     for name in CANDIDATE_JSONL:
         p = run_dir / name
         if p.exists():
             return p
-    # 再找 records/
+    # 2) search in records/
     rec = run_dir / "records"
     for name in CANDIDATE_JSONL:
         p = rec / name
         if p.exists():
             return p
-    # 都没匹配到：在根目录和 records/ 各挑第一个“能 parse 的 jsonl”
+    # 3) fallback: pick the first "*.jsonl" that is parseable under run root / records
     for base in (run_dir, rec):
         for p in sorted(base.glob("*.jsonl")):
             for _ in _iter_jsonl(p):
@@ -66,7 +70,7 @@ def _find_epoch_file(run_dir: Path) -> Optional[Path]:
     return None
 
 def _load_config(run_dir: Path) -> Dict[str, Any]:
-    # 主要在 records/config_init.json；如果没有就尝试根目录
+    # Prefer records/config_init.json; fallback to run_root/config_init.json
     for p in (run_dir / "records" / "config_init.json", run_dir / "config_init.json"):
         if p.exists():
             try:
@@ -95,9 +99,9 @@ def _load_config(run_dir: Path) -> Dict[str, Any]:
 
 def _scan_metrics(epoch_file: Path) -> Tuple[Dict[str, Any], Dict[str, float]]:
     """
-    返回：
-      last_vals: 最后一行可用的 {val_mrr,val_top1,val_top10,val_loss,train_loss,epoch}
-      bests:     {'best_val_mrr','best_val_top1','best_val_top10'}
+    Returns:
+      last_vals: last available values {val_mrr, val_top1, val_top10, val_loss, train_loss, epoch}
+      bests:     {'best_val_mrr', 'best_val_top1', 'best_val_top10'}
     """
     last_epoch = None
     last_vals: Dict[str, Any] = {}
@@ -108,19 +112,19 @@ def _scan_metrics(epoch_file: Path) -> Tuple[Dict[str, Any], Dict[str, float]]:
         if ep is None:
             continue
 
-        # 兼容字段名
+        # Field-name compatibility
         cur_mrr   = _to_float(row.get("val_self_mrr")   or row.get("val_mrr"))
         cur_top1  = _to_float(row.get("val_self_top1")  or row.get("val_top1"))
         cur_top10 = _to_float(row.get("val_self_top10") or row.get("val_top10"))
         cur_vloss = _to_float(row.get("val_loss"))
         cur_tloss = _to_float(row.get("train_loss"))
 
-        # 更新 best
+        # Update bests
         if cur_mrr   is not None:  best["best_val_mrr"]   = max(best["best_val_mrr"],   cur_mrr)
         if cur_top1  is not None:  best["best_val_top1"]  = max(best["best_val_top1"],  cur_top1)
         if cur_top10 is not None:  best["best_val_top10"] = max(best["best_val_top10"], cur_top10)
 
-        # 保存“最后一行”
+        # Track the "last row"
         last_epoch = ep
         last_vals = {
             "epoch": ep,
@@ -131,14 +135,14 @@ def _scan_metrics(epoch_file: Path) -> Tuple[Dict[str, Any], Dict[str, float]]:
             "train_loss": cur_tloss,
         }
 
-        # 兼容某些训练脚本把“监控的 best”写在 best_val_top10 字段的做法：
-        # 如果文件中确实带有 best_val_*，以文件里的值对当前 best 做 max（不影响我们自己算的上界）
+        # Some training scripts may already log best_val_* fields.
+        # If present, take max with our running best (keeps an upper envelope; does not reduce our computed best).
         for k in ("best_val_mrr", "best_val_top1", "best_val_top10"):
             v = _to_float(row.get(k))
             if v is not None:
                 best[k] = max(best[k], v)
 
-    # 把没出现过的 best 置 None
+    # Convert missing bests to None
     for k in list(best.keys()):
         if best[k] == float("-inf"):
             best[k] = None
@@ -159,14 +163,14 @@ def summarize_runs(runs_dir: Path, prefix: Optional[str]) -> List[Dict[str, Any]
         cfg = _load_config(run)
         last, bests = _scan_metrics(epoch_file)
 
-        # 选择排序用的 best_metric
+        # Pick best_metric according to the monitor field
         mon = (cfg.get("monitor") or "mrr").lower()
         if mon not in ("mrr", "top1", "top10"):
             mon = "mrr"
         mon_key = {"mrr": "best_val_mrr", "top1": "best_val_top1", "top10": "best_val_top10"}[mon]
         best_metric = bests.get(mon_key)
 
-        # 写一行
+        # Emit one summary row
         rows.append({
             "run_dir": run.name,
             "epoch_file": str(epoch_file.relative_to(run)),
@@ -182,7 +186,7 @@ def summarize_runs(runs_dir: Path, prefix: Optional[str]) -> List[Dict[str, Any]
             "best_val_mrr": bests.get("best_val_mrr"),
             "best_val_top1": bests.get("best_val_top1"),
             "best_val_top10": bests.get("best_val_top10"),
-            # 超参
+            # Hyperparameters (for quick comparison)
             "warmup_ratio": cfg.get("warmup_ratio"),
             "fe_lr_mult": cfg.get("fe_lr_mult"),
             "freeze_backbone_epochs": cfg.get("freeze_backbone_epochs"),
@@ -197,7 +201,7 @@ def summarize_runs(runs_dir: Path, prefix: Optional[str]) -> List[Dict[str, Any]
             "tpp_slots": cfg.get("tpp_slots"),
         })
 
-    # 按 monitor 的 best_metric（越大越好）降序；None 排最后
+    # Sort by best_metric (descending); None goes last
     rows.sort(key=lambda r: (-1 if r["best_metric"] is None else 0, r["best_metric"] or -1), reverse=True)
     return rows
 
@@ -213,7 +217,7 @@ def main():
     rows = summarize_runs(runs_dir, args.prefix or None)
 
     if not rows:
-        print("[WARN] 没找到可汇总的 runs。检查 --runs-dir 或 --prefix。")
+        print("[WARN] No runs found to summarize. Check --runs-dir or --prefix.")
         return
 
     out_csv = runs_dir / args.out_csv
@@ -222,7 +226,7 @@ def main():
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"[OK] 写入：{out_csv}  （共 {len(rows)} 条）\n")
+    print(f"[OK] Wrote: {out_csv}  (total {len(rows)} runs)\n")
     print(f"Top-{args.topk}: (monitor={rows[0]['monitor']}, best_metric DESC)")
     for i, r in enumerate(rows[:args.topk], 1):
         lt = 1 if r.get("learnable_temp") else 0
