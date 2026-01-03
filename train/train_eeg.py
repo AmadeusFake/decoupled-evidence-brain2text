@@ -25,7 +25,7 @@ import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
 from pytorch_lightning.utilities import rank_zero_only
 
-# Ensure models/eeg_encoder.py exists and contains UltimateMEGEncoder
+# Exp-dilated encoder for EEG encoding
 from models.eeg_encoder import UltimateMEGEncoder
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")

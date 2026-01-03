@@ -14,7 +14,7 @@ PROJECT_ROOT="/mimer/NOBACKUP/groups/naiss2024-5-164/Xinyu/July_Project"
 DATA_ROOT="${PROJECT_ROOT}/data_manifests_local_global"
 
 # Directory containing GW audio sentence-level scripts
-SCRIPT_DIR="${PROJECT_ROOT}/data_script_gw"
+SCRIPT_DIR="${PROJECT_ROOT}/data_script_GW"
 
 ###############################################################################
 # Scripts (internal, do NOT edit)
