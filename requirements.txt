@@ -1,15 +1,10 @@
-# python 3.8 (p3.9 not supported because of an unmaintained dependency)
-# create the env:
-# conda create -n <name> ipython python=3.8 -y
-#
-# conda install pytorch cudatoolkit=10.1 -c pytorch
-
 torch>=1.5
 torchaudio>=0.7.0
 hydra-core>=1.1
 julius
 mne>=0.24.1
 pandas>=1.1
+tqdm
 python-Levenshtein
 scikit-learn
 wordfreq
@@ -22,13 +17,13 @@ types-PyYAML
 spacy<2.4.0
 wandb
 numba
-mne_bids  # for gwilliams2022 dataset
+mne_bids
 osfclient
-matplotlib >= 3.5.1
+matplotlib>=3.5.1
 scipy
 submitit
-dora-search
 flashy
-transformers >= 4.15.0 # for BERT and Wav2Vec embeddings
+transformers>=4.15.0
 pyyaml
-autoreject
+jsonlines
+pytorch-lightning<2.0
